@@ -197,7 +197,9 @@ def _get_or_assign(session_id: str) -> tuple[ContainerRecord | None, str | None]
             remaining = deadline - time.time()
             if remaining <= 0:
                 return None, "no containers available (timed out after 60s)"
-            _condition.wait(timeout=remaining)
+            _condition.wait(
+                timeout=remaining
+            )  # Only allows one thread to try & exit the while loop at a time
 
         rec = _warm_pool.pop(0)
         rec.status = "assigned"
