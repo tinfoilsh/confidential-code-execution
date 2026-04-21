@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # ---------------------------------------------------------------------------
 ADMIN_API_KEY = os.environ["ADMIN_API_KEY"]
 POOL_SIZE = int(os.environ.get("POOL_SIZE", "3"))
+MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", "10"))
 PORT = int(os.environ.get("PORT", "7000"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "2"))
 CONFIG_REPO = os.environ.get("CONFIG_REPO", "tinfoilsh/confidential-code-execution")
@@ -122,7 +123,9 @@ def _delete_container(container_id: str) -> None:
 def _replenish_pool() -> list[ContainerRecord]:
     """Create containers to fill the pool. Returns newly created records."""
     with _lock:
-        needed = POOL_SIZE - len(_warm_pool) - len(_inflight)
+        total = len(_warm_pool) + len(_inflight) + len(_sessions)
+        target = min(len(_sessions) + POOL_SIZE, MAX_CONTAINERS)
+        needed = target - total
     new_records = []
     for _ in range(needed):
         rec = _create_container()
@@ -179,24 +182,28 @@ def _pool_manager_loop() -> None:
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
-def _get_or_assign(session_id: str) -> ContainerRecord | None:
-    """Assign a container to a session, blocking up to 60s if pool is empty."""
+def _get_or_assign(session_id: str) -> tuple[ContainerRecord | None, str | None]:
+    """Assign a container to a session, blocking up to 60s if pool is empty.
+    Returns (record, error_message). error_message is set when at capacity."""
     with _condition:
         if session_id in _sessions:
-            return _sessions[session_id]
+            return _sessions[session_id], None
+
+        if len(_sessions) >= MAX_CONTAINERS:
+            return None, f"at capacity ({MAX_CONTAINERS} sessions)"
 
         deadline = time.time() + 60
         while not _warm_pool:
             remaining = deadline - time.time()
             if remaining <= 0:
-                return None
+                return None, "no containers available (timed out after 60s)"
             _condition.wait(timeout=remaining)
 
         rec = _warm_pool.pop(0)
         rec.status = "assigned"
         _sessions[session_id] = rec
         print(f"orchestrator: assigned {rec.name} to session {session_id}")
-        return rec
+        return rec, None
 
 
 def _cleanup_session(session_id: str) -> ContainerRecord | None:
@@ -269,6 +276,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                         "inflight": len(_inflight),
                         "sessions": len(_sessions),
                         "pool_target": POOL_SIZE,
+                        "max_containers": MAX_CONTAINERS,
                     },
                 )
             return
@@ -281,11 +289,9 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             self._respond(400, {"error": "sessionId is required"})
             return
 
-        rec = _get_or_assign(session_id)
+        rec, err = _get_or_assign(session_id)
         if rec is None:
-            self._respond(
-                503, {"error": "no containers available (timed out after 60s)"}
-            )
+            self._respond(503, {"error": err})
             return
 
         # Strip sessionId before forwarding — executor doesn't know about sessions
@@ -314,7 +320,7 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print(
-        f"orchestrator: pool_size={POOL_SIZE} poll_interval={POLL_INTERVAL}s debug={DEBUG_MODE}"
+        f"orchestrator: pool_size={POOL_SIZE} max_containers={MAX_CONTAINERS} poll_interval={POLL_INTERVAL}s debug={DEBUG_MODE}"
     )
     print(f"orchestrator: repo={CONFIG_REPO} tag={CONFIG_TAG}")
 

@@ -160,7 +160,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ```bash
 # Terminal 1: start orchestrator
 cd /Users/dmccanns/Desktop/Tinfoil/code-execution/code-container
-export ADMIN_API_KEY="admin_qsOcJEnbiZ42TKEr7BfMkQtFYCOSxDuczE7LIsoxfw7PYbvv"
+# get key from .env
 python orchestrator/main.py
 ```
 
