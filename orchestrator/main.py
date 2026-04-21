@@ -9,10 +9,6 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from dotenv import load_dotenv
-
-load_dotenv()
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -71,6 +67,7 @@ def _api_request(
         headers={
             "Authorization": f"Bearer {ADMIN_API_KEY}",
             "Content-Type": "application/json",
+            "User-Agent": "tinfoil-orchestrator/1.0",
         },
     )
     try:
@@ -79,9 +76,10 @@ def _api_request(
                 return 204, None
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
+        raw = e.read()
         resp_body = None
         try:
-            resp_body = json.loads(e.read())
+            resp_body = json.loads(raw)
         except Exception:
             pass
         print(f"orchestrator: API error {e.code} {method} {path}: {resp_body}")
