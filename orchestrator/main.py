@@ -47,6 +47,7 @@ _sessions: dict[str, ContainerRecord] = {}
 _failed: list[ContainerRecord] = []  # keeps last N failures for display
 _fail_count: int = 0  # total cumulative failures
 _api_errors: int = 0  # total create-container API errors
+_shutting_down: bool = False
 
 # ---------------------------------------------------------------------------
 # Tinfoil controlplane API helpers
@@ -187,10 +188,11 @@ def _poll_inflight() -> None:
 def _pool_manager_loop() -> None:
     """Background daemon loop that keeps the warm pool full."""
     consecutive_failures = 0
-    while True:
+    while not _shutting_down:
         created: list[ContainerRecord] = []
         try:
-            created = _replenish_pool()
+            if not _shutting_down:
+                created = _replenish_pool()
             _poll_inflight()
             if created:
                 consecutive_failures = 0
@@ -309,6 +311,8 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             self._handle_cleanup()
         elif self.path == "/delete-all":
             self._handle_delete_all()
+        elif self.path == "/finish":
+            self._handle_finish()
         else:
             self.send_error(404)
 
@@ -433,6 +437,32 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
         self._respond(
             200, {"deleted": deleted, "skipped": skipped, "count": len(deleted)}
         )
+
+    def _handle_finish(self):
+        """Stop replenishing, delete all containers, shut down the server."""
+        global _shutting_down
+        _shutting_down = True
+        print("orchestrator: finishing — deleting all containers and shutting down")
+        # Reuse delete-all logic inline
+        with _lock:
+            all_recs = list(_warm_pool) + list(_inflight) + list(_sessions.values())
+            _warm_pool.clear()
+            _inflight.clear()
+            _sessions.clear()
+            _failed.clear()
+        deleted = []
+        for rec in all_recs:
+            status_code, remote = _api_request("GET", f"/api/containers/{rec.id}")
+            if status_code != 200 or remote is None:
+                continue
+            if remote.get("name", "") != rec.name:
+                continue
+            print(f"orchestrator: deleting {rec.name} ({rec.id}) — verified")
+            _delete_container(rec.id)
+            deleted.append(rec.name)
+        self._respond(200, {"status": "finished", "deleted": deleted, "count": len(deleted)})
+        # Shut down the server in a background thread so the response sends first
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def log_message(self, format, *args):
         print(f"orchestrator: {args[0]}")
