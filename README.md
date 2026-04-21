@@ -4,6 +4,8 @@
 
 Spins up multiple environment containers. Manages them. Routes requests through to them.
 
+**Threading approach w/ ThreadingHTTPServer**: only uses stdlib. Threads cost more memory, could be annoying at >1k concurrent
+
 ## Environment Container
 
 - **api-server** (port 8000) — HTTP API exposed via the Tinfoil shim. Proxies requests to the executor.
