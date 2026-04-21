@@ -8,6 +8,9 @@ docker exec -it code-executor bash
 curl -X POST http://localhost:8000/exec \
   -H "Content-Type: application/json" \
   -d '{
-    "echo hello > /workspace/hello.txt\ncat /workspace/hello.txt"
+    "command": "echo hello > /workspace/hello.txt\ncat /workspace/hello.txt"
   }'
 ```
+
+Should see:
+`{"stdout": "hello\n", "stderr": "", "exit_code": 0}`
