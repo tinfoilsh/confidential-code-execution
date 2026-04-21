@@ -7,8 +7,10 @@ EXECUTOR_URL = "http://localhost:9000"
 
 
 class APIHandler(BaseHTTPRequestHandler):
+    ALLOWED_PATHS = {"/exec", "/read", "/write"}
+
     def do_POST(self):
-        if self.path != "/exec":
+        if self.path not in self.ALLOWED_PATHS:
             self.send_error(404)
             return
 
@@ -17,7 +19,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         try:
             req = urllib.request.Request(
-                f"{EXECUTOR_URL}/exec",
+                f"{EXECUTOR_URL}{self.path}",
                 data=body,
                 headers={"Content-Type": "application/json"},
                 method="POST",
