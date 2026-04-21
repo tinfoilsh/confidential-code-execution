@@ -9,6 +9,10 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -135,9 +139,10 @@ def _replenish_pool() -> list[ContainerRecord]:
     new_records = []
     for _ in range(needed):
         rec = _create_container()
-        if rec:
-            new_records.append(rec)
-            print(f"orchestrator: created container {rec.name} ({rec.id})")
+        if rec is None:
+            break  # stop on first failure — don't spam a broken API
+        new_records.append(rec)
+        print(f"orchestrator: created container {rec.name} ({rec.id})")
     if new_records:
         with _lock:
             _inflight.extend(new_records)
@@ -183,13 +188,40 @@ def _poll_inflight() -> None:
 
 def _pool_manager_loop() -> None:
     """Background daemon loop that keeps the warm pool full."""
+    consecutive_failures = 0
     while True:
+        created: list[ContainerRecord] = []
         try:
-            _replenish_pool()
+            created = _replenish_pool()
             _poll_inflight()
+            if created:
+                consecutive_failures = 0
+            elif consecutive_failures > 0:
+                # still failing — no need to check, just wait
+                pass
         except Exception as e:
             print(f"orchestrator: pool manager error: {e}")
-        time.sleep(POLL_INTERVAL)
+
+        # Check if last replenish created nothing when it should have
+        with _lock:
+            needed = (
+                min(len(_sessions) + POOL_SIZE, MAX_CONTAINERS)
+                - len(_warm_pool)
+                - len(_inflight)
+                - len(_sessions)
+            )
+        if needed > 0 and not created:
+            consecutive_failures += 1
+        else:
+            consecutive_failures = 0
+
+        # Backoff: 2s, 4s, 8s, 16s, max 30s
+        delay = min(POLL_INTERVAL * (2 ** min(consecutive_failures, 4)), 30)
+        if consecutive_failures > 0 and consecutive_failures % 5 == 1:
+            print(
+                f"orchestrator: create failing, backoff {delay}s (consecutive failures: {consecutive_failures})"
+            )
+        time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
