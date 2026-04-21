@@ -126,7 +126,7 @@ Lowercase alphanumeric + hyphens, satisfies Tinfoil naming constraints. 8 hex ch
 | --------------- | -------- | --------------------------------------- | ------------------------------------------ |
 | `ADMIN_API_KEY` | Yes      | —                                       | Admin API key for controlplane             |
 | `POOL_SIZE`     | No       | `3`                                     | Number of warm containers to maintain      |
-| `PORT`          | No       | `7000`                                  | Port for the orchestrator HTTP server      |
+| `PORT`          | No       | `7070`                                  | Port for the orchestrator HTTP server      |
 | `POLL_INTERVAL` | No       | `2`                                     | Seconds between pool manager cycles        |
 | `CONFIG_REPO`   | No       | `tinfoilsh/confidential-code-execution` | GitHub repo for container config           |
 | `CONFIG_TAG`    | No       | `v0.0.2`                                | Git tag to deploy                          |
@@ -168,28 +168,28 @@ python orchestrator/main.py
 # Terminal 2: test
 
 # 1. Check pool is filling
-curl http://localhost:7000/health
+curl http://localhost:7070/health
 
 # 2. Wait ~1-3 min for containers to become ready, then:
-curl -X POST http://localhost:7000/exec \
+curl -X POST http://localhost:7070/exec \
   -H "Content-Type: application/json" \
   -d '{"sessionId": "test1", "command": "echo hello"}'
 
 # 3. Same session, read a file
-curl -X POST http://localhost:7000/read \
+curl -X POST http://localhost:7070/read \
   -H "Content-Type: application/json" \
   -d '{"sessionId": "test1", "path": "/etc/hostname"}'
 
 # 4. Different session (gets a different container)
-curl -X POST http://localhost:7000/exec \
+curl -X POST http://localhost:7070/exec \
   -H "Content-Type: application/json" \
   -d '{"sessionId": "test2", "command": "whoami"}'
 
 # 5. Cleanup a session
-curl -X POST http://localhost:7000/cleanup \
+curl -X POST http://localhost:7070/cleanup \
   -H "Content-Type: application/json" \
   -d '{"sessionId": "test1"}'
 
 # 6. Pool should replenish
-curl http://localhost:7000/health
+curl http://localhost:7070/health
 ```

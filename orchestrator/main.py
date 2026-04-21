@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ADMIN_API_KEY = os.environ["ADMIN_API_KEY"]
 POOL_SIZE = int(os.environ.get("POOL_SIZE", "3"))
 MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", "10"))
-PORT = int(os.environ.get("PORT", "7000"))
+PORT = int(os.environ.get("PORT", "7070"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "2"))
 CONFIG_REPO = os.environ.get("CONFIG_REPO", "tinfoilsh/confidential-code-execution")
 CONFIG_TAG = os.environ.get("CONFIG_TAG", "v0.0.2")

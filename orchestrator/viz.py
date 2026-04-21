@@ -6,7 +6,7 @@ import sys
 import time
 import urllib.request
 
-URL = os.environ.get("ORCHESTRATOR_URL", "http://localhost:7000")
+URL = os.environ.get("ORCHESTRATOR_URL", "http://localhost:7070")
 
 # ANSI colors
 RESET = "\033[0m"
