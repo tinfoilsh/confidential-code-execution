@@ -44,6 +44,9 @@ _condition = threading.Condition(_lock)
 _warm_pool: list[ContainerRecord] = []
 _inflight: list[ContainerRecord] = []
 _sessions: dict[str, ContainerRecord] = {}
+_failed: list[ContainerRecord] = []  # keeps last N failures for display
+_fail_count: int = 0  # total cumulative failures
+_api_errors: int = 0  # total create-container API errors
 
 # ---------------------------------------------------------------------------
 # Tinfoil controlplane API helpers
@@ -95,6 +98,9 @@ def _create_container() -> ContainerRecord | None:
     )
     if status_code != 201 or data is None:
         print(f"orchestrator: failed to create container {name}: {status_code}")
+        global _api_errors
+        with _lock:
+            _api_errors += 1
         return None
     return ContainerRecord(
         id=data["id"],
@@ -161,9 +167,16 @@ def _poll_inflight() -> None:
                 if rec in _inflight:
                     _inflight.remove(rec)
                     _warm_pool.append(rec)
+            global _fail_count
             for rec in failed:
                 if rec in _inflight:
                     _inflight.remove(rec)
+                    rec.status = "failed"
+                    _failed.append(rec)
+                    _fail_count += 1
+            # keep only last 10 failures for display
+            while len(_failed) > 10:
+                _failed.pop(0)
             if ready:
                 _condition.notify_all()
 
@@ -281,6 +294,33 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                         "max_containers": MAX_CONTAINERS,
                     },
                 )
+            return
+        if self.path == "/metrics":
+            now = time.time()
+            with _lock:
+
+                def _rec(r, session_id=None):
+                    d = {
+                        "id": r.id,
+                        "name": r.name,
+                        "status": r.status,
+                        "uptime": round(now - r.created_at),
+                    }
+                    if session_id:
+                        d["session_id"] = session_id
+                    return d
+
+                data = {
+                    "warm_pool": [_rec(r) for r in _warm_pool],
+                    "inflight": [_rec(r) for r in _inflight],
+                    "sessions": [_rec(r, sid) for sid, r in _sessions.items()],
+                    "failed": [_rec(r) for r in _failed],
+                    "fail_count": _fail_count,
+                    "api_errors": _api_errors,
+                    "pool_target": POOL_SIZE,
+                    "max_containers": MAX_CONTAINERS,
+                }
+            self._respond(200, data)
             return
         self.send_error(404)
 
