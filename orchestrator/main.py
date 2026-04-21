@@ -85,7 +85,7 @@ def _api_request(
 
 
 def _create_container() -> ContainerRecord | None:
-    name = f"exec-{uuid.uuid4().hex[:8]}"
+    name = f"daniel-exec-{uuid.uuid4().hex[:8]}"
     status_code, data = _api_request(
         "POST",
         "/api/containers",
@@ -277,6 +277,8 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             self._handle_proxy(self.path)
         elif self.path == "/cleanup":
             self._handle_cleanup()
+        elif self.path == "/delete-all":
+            self._handle_delete_all()
         else:
             self.send_error(404)
 
@@ -352,6 +354,55 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             self._respond(404, {"error": f"no session found for {session_id}"})
             return
         self._respond(200, {"status": "cleaned up", "container": rec.name})
+
+    def _handle_delete_all(self):
+        """Delete every tracked container and clear all state.
+
+        Safety: verifies each container exists on the controlplane and its
+        name matches our local record before issuing the DELETE.
+        """
+        with _lock:
+            all_recs = list(_warm_pool) + list(_inflight) + list(_sessions.values())
+            _warm_pool.clear()
+            _inflight.clear()
+            _sessions.clear()
+            _failed.clear()
+        deleted = []
+        skipped = []
+        for rec in all_recs:
+            # Double-check: fetch from controlplane and verify name matches
+            status_code, remote = _api_request("GET", f"/api/containers/{rec.id}")
+            if status_code != 200 or remote is None:
+                print(
+                    f"orchestrator: skip delete {rec.name} ({rec.id}) — not found on controlplane ({status_code})"
+                )
+                skipped.append(
+                    {
+                        "name": rec.name,
+                        "id": rec.id,
+                        "reason": "not found on controlplane",
+                    }
+                )
+                continue
+            remote_name = remote.get("name", "")
+            if remote_name != rec.name:
+                print(
+                    f"orchestrator: skip delete {rec.name} ({rec.id}) — name mismatch: remote={remote_name}"
+                )
+                skipped.append(
+                    {
+                        "name": rec.name,
+                        "id": rec.id,
+                        "reason": f"name mismatch: expected {rec.name}, got {remote_name}",
+                    }
+                )
+                continue
+            print(f"orchestrator: deleting {rec.name} ({rec.id}) — verified")
+            _delete_container(rec.id)
+            deleted.append(rec.name)
+        self._respond(
+            200, {"deleted": deleted, "skipped": skipped, "count": len(deleted)}
+        )
 
     def log_message(self, format, *args):
         print(f"orchestrator: {args[0]}")
