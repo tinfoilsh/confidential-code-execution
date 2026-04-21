@@ -18,7 +18,7 @@ MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", "10"))
 PORT = int(os.environ.get("PORT", "7070"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "2"))
 CONFIG_REPO = os.environ.get("CONFIG_REPO", "tinfoilsh/confidential-code-execution")
-CONFIG_TAG = os.environ.get("CONFIG_TAG", "v0.0.2")
+CONFIG_TAG = os.environ.get("CONFIG_TAG", "v0.0.3")
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "true").lower() == "true"
 
 API_BASE = "https://api.tinfoil.sh"
@@ -460,7 +460,9 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             print(f"orchestrator: deleting {rec.name} ({rec.id}) — verified")
             _delete_container(rec.id)
             deleted.append(rec.name)
-        self._respond(200, {"status": "finished", "deleted": deleted, "count": len(deleted)})
+        self._respond(
+            200, {"status": "finished", "deleted": deleted, "count": len(deleted)}
+        )
         # Shut down the server in a background thread so the response sends first
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
