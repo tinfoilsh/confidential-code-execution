@@ -26,6 +26,7 @@ class ExecHandler(BaseHTTPRequestHandler):
                 capture_output=True,
                 text=True,
                 timeout=30,
+                cwd="/workspace",
             )
             response = {
                 "stdout": result.stdout,

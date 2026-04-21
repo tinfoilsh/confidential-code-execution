@@ -5,7 +5,7 @@ Two-container setup for running bash commands inside a Tinfoil enclave.
 ## Architecture
 
 - **api-server** (port 8000) — HTTP API exposed via the Tinfoil shim. Proxies requests to the executor.
-- **executor** (port 9000) — Runs bash commands in an isolated container. Not directly exposed.
+- **executor** (port 9000) — Runs bash comamnds w/ subprocess run
 
 ## API
 
