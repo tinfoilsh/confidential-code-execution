@@ -34,6 +34,8 @@ class ContainerRecord:
     domain: str  # from POST response "domain" field
     status: str  # deploying | ready | assigned | deleting
     created_at: float
+    ssh_port: int = 0  # SSH port from create response
+    assigned_at: float = 0.0  # when session was assigned
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +114,7 @@ def _create_container() -> ContainerRecord | None:
         domain=data["domain"],
         status="deploying",
         created_at=time.time(),
+        ssh_port=data.get("ssh_port", 0),
     )
 
 
@@ -255,6 +258,7 @@ def _get_or_assign(
 
         rec = _warm_pool.pop(0)
         rec.status = "assigned"
+        rec.assigned_at = time.time()
         _sessions[session_id] = rec
         print(f"orchestrator: assigned {rec.name} to session {session_id}")
         return rec, None
@@ -348,9 +352,13 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
                         "name": r.name,
                         "status": r.status,
                         "uptime": round(now - r.created_at),
+                        "ssh_port": r.ssh_port,
                     }
                     if session_id:
                         d["session_id"] = session_id
+                        d["active_time"] = (
+                            round(now - r.assigned_at) if r.assigned_at else 0
+                        )
                     return d
 
                 data = {

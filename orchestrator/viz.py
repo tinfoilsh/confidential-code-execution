@@ -33,14 +33,18 @@ def fmt_uptime(s: int) -> str:
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
-def box(label: str, sub: str, bg: str, width: int = 30) -> list[str]:
-    """Render a single container as a 3-line box."""
+def box(label: str, sub: str, bg: str, width: int = 30, extra: str = "") -> list[str]:
+    """Render a single container as a box."""
     inner = width - 2
     top = f"{bg} {'─' * inner} {RESET}"
     mid = f"{bg} {BOLD}{label:<{inner}}{RESET}{bg} {RESET}"
     bot_text = f"{sub:<{inner}}"
     bot = f"{bg} {DIM}{bot_text}{RESET}{bg} {RESET}"
-    return [top, mid, bot]
+    lines = [top, mid, bot]
+    if extra:
+        ext_text = f"{extra:<{inner}}"
+        lines.append(f"{bg} {DIM}{ext_text}{RESET}{bg} {RESET}")
+    return lines
 
 
 def render(data: dict) -> str:
@@ -103,8 +107,8 @@ def _layout_boxes(
     containers: list[dict], bg: str, fg: str, show_session: bool = False
 ) -> list[str]:
     """Lay out boxes side-by-side, wrapping at terminal width."""
-    cols = max(1, (os.get_terminal_size().columns - 4) // 32)
-    box_width = 30
+    box_width = 44 if show_session else 30
+    cols = max(1, (os.get_terminal_size().columns - 4) // (box_width + 2))
     rows: list[str] = []
 
     for i in range(0, len(containers), cols):
@@ -113,13 +117,22 @@ def _layout_boxes(
         for c in chunk:
             label = c["name"]
             sub = f"{c['id'][:8]}  {fmt_uptime(c['uptime'])}"
+            extra = ""
             if show_session and c.get("session_id"):
-                sub = f"sid:{c['session_id'][:12]}  {fmt_uptime(c['uptime'])}"
-            rendered.append(box(label, sub, bg, box_width))
+                active = c.get("active_time", 0)
+                sub = f"sid:{c['session_id'][:12]}  active {fmt_uptime(active)}"
+                ssh_port = c.get("ssh_port", 0)
+                if ssh_port:
+                    extra = f"ssh -p {ssh_port} root@console.tinfoil.sh"
+            rendered.append(box(label, sub, bg, box_width, extra))
 
-        # zip the 3 lines of each box together
-        for row_idx in range(3):
-            line = "    " + "  ".join(b[row_idx] for b in rendered)
+        # zip the lines of each box together (may be 3 or 4 lines)
+        max_lines = max(len(b) for b in rendered)
+        for row_idx in range(max_lines):
+            blank = " " * box_width
+            line = "    " + "  ".join(
+                b[row_idx] if row_idx < len(b) else blank for b in rendered
+            )
             rows.append(line)
         rows.append("")
 
