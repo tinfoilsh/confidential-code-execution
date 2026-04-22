@@ -13,12 +13,9 @@ SERVER_NAME = "confidential-code-execution"
 SERVER_VERSION = "0.1.0"
 
 
-def extract_session_id(headers) -> str:
-    """Extract session ID from request headers. Client resonsibility to send this. Necessary"""
-    sid = headers.get("X-Session-Id")
-    if sid:
-        return sid
-    return "mcp-default"
+def extract_session_id(headers) -> str | None:
+    """Extract session ID from X-Session-Id header. Returns None if missing."""
+    return headers.get("X-Session-Id") or None
 
 
 def handle_mcp_request(
@@ -77,6 +74,17 @@ def _handle_tool_call(manager: ContainerManager, headers, params: dict) -> dict:
     name = params.get("name", "")
     arguments = params.get("arguments", {})
     session_id = extract_session_id(headers)
+
+    if session_id is None:
+        return {
+            "isError": True,
+            "content": [
+                {
+                    "type": "text",
+                    "text": "X-Session-Id header is required for code execution tools",
+                }
+            ],
+        }
 
     handler = TOOL_HANDLERS.get(name)
     if not handler:
