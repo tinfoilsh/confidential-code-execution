@@ -18,7 +18,7 @@ MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", "10"))
 PORT = int(os.environ.get("PORT", "7070"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "2"))
 CONFIG_REPO = os.environ.get("CONFIG_REPO", "tinfoilsh/confidential-code-execution")
-CONFIG_TAG = os.environ.get("CONFIG_TAG", "v0.0.4")
+CONFIG_TAG = os.environ.get("CONFIG_TAG", "v0.0.5")
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "true").lower() == "true"
 
 API_BASE = "https://api.tinfoil.sh"
@@ -97,6 +97,7 @@ def _create_container() -> ContainerRecord | None:
             "repo": CONFIG_REPO,
             "tag": CONFIG_TAG,
             "debug": DEBUG_MODE,
+            "ssh_keys": ["daniel"],
         },
     )
     if status_code != 201 or data is None:
@@ -227,9 +228,12 @@ def _pool_manager_loop() -> None:
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
-def _get_or_assign(session_id: str) -> tuple[ContainerRecord | None, str | None]:
+def _get_or_assign(
+    session_id: str, is_connected=None
+) -> tuple[ContainerRecord | None, str | None]:
     """Assign a container to a session, blocking up to 60s if pool is empty.
-    Returns (record, error_message). error_message is set when at capacity."""
+    Returns (record, error_message). is_connected is checked every 2s to
+    detect client disconnect so we don't assign a container to a dead request."""
     with _condition:
         if session_id in _sessions:
             return _sessions[session_id], None
@@ -242,9 +246,12 @@ def _get_or_assign(session_id: str) -> tuple[ContainerRecord | None, str | None]
             remaining = deadline - time.time()
             if remaining <= 0:
                 return None, "no containers available (timed out after 60s)"
-            _condition.wait(
-                timeout=remaining
-            )  # Only allows one thread to try & exit the while loop at a time
+            if is_connected and not is_connected():
+                print(
+                    f"orchestrator: client disconnected while waiting for session {session_id}"
+                )
+                return None, "client disconnected"
+            _condition.wait(timeout=min(remaining, 2))
 
         rec = _warm_pool.pop(0)
         rec.status = "assigned"
@@ -367,8 +374,17 @@ class OrchestratorHandler(BaseHTTPRequestHandler):
             self._respond(400, {"error": "sessionId is required"})
             return
 
-        rec, err = _get_or_assign(session_id)
+        def is_connected():
+            try:
+                self.connection.getpeername()
+                return True
+            except Exception:
+                return False
+
+        rec, err = _get_or_assign(session_id, is_connected)
         if rec is None:
+            if err == "client disconnected":
+                return  # don't bother responding, nobody's listening
             self._respond(503, {"error": err})
             return
 
