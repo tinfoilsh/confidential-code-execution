@@ -18,7 +18,7 @@ MAX_CONTAINERS = int(os.environ.get("MAX_CONTAINERS", "10"))
 PORT = int(os.environ.get("PORT", "7070"))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "2"))
 CONFIG_REPO = os.environ.get("CONFIG_REPO", "tinfoilsh/confidential-code-execution")
-CONFIG_TAG = os.environ.get("CONFIG_TAG", "v0.0.3")
+CONFIG_TAG = os.environ.get("CONFIG_TAG", "v0.0.4")
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "true").lower() == "true"
 
 API_BASE = "https://api.tinfoil.sh"
