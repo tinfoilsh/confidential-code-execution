@@ -13,19 +13,6 @@ export ADMIN_API_KEY="..."
 python orchestrator/main.py
 ```
 
-Config via env vars:
-
-| Variable         | Default                                 | Description                         |
-| ---------------- | --------------------------------------- | ----------------------------------- |
-| `ADMIN_API_KEY`  | required                                | Admin API key for controlplane      |
-| `POOL_SIZE`      | `3`                                     | Warm containers to maintain         |
-| `MAX_CONTAINERS` | `10`                                    | Max total containers                |
-| `PORT`           | `7070`                                  | Orchestrator port                   |
-| `POLL_INTERVAL`  | `2`                                     | Seconds between pool manager cycles |
-| `CONFIG_REPO`    | `tinfoilsh/confidential-code-execution` | Container repo                      |
-| `CONFIG_TAG`     | `v0.0.3`                                | Container tag                       |
-| `DEBUG_MODE`     | `true`                                  | Deploy in debug mode                |
-
 ### API
 
 ```
@@ -52,13 +39,17 @@ GET /health        — pool counts
 GET /metrics       — full container details (used by viz.py)
 ```
 
-### Dashboard
+### Visualizer
 
 ```bash
 python orchestrator/viz.py
 ```
 
 Polls `/metrics` every second. Shows warm pool (green), inflight (yellow), active sessions (cyan), and failures (red).
+
+### Agent
+
+`agent.py` is a minimal implementation that defines our code execution tools - bash & text editor - and usese tinfoils inference to make a very simple agent loop to test out code execution.
 
 ## Environment Container
 
