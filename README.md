@@ -51,7 +51,26 @@ Polls `/metrics` every second. Shows warm pool (green), inflight (yellow), activ
 
 `agent.py` is a minimal implementation that defines our code execution tools - bash & text editor - and usese tinfoils inference to make a very simple agent loop to test out code execution.
 
+## Test
+
+```bash
+docker exec -it code-executor bash
+```
+
+```bash
+curl -X POST http://localhost:8000/exec \
+  -H "Content-Type: application/json" \
+  -d '{
+    "command": "echo hello > /workspace/hello.txt\ncat /workspace/hello.txt"
+  }'
+```
+
+Should see:
+`{"stdout": "hello\n", "stderr": "", "exit_code": 0}`
+
 ## Environment Container
+
+_in code-execution-environment repo_
 
 - **api-server** (port 8000) — HTTP API exposed via the Tinfoil shim. Proxies requests to the executor.
 - **executor** (port 9000) — Runs bash comamnds w/ subprocess run
