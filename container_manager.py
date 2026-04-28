@@ -8,6 +8,9 @@ import urllib.error
 import urllib.request
 import uuid
 
+import httpx
+from tinfoil.client import SecureClient
+
 API_BASE = "https://api.tinfoil.sh"
 
 # Trust default CAs for api.tinfoil.sh
@@ -35,6 +38,7 @@ class ContainerManager:
         max_containers: int = 10,
         poll_interval: int = 2,
         debug_mode: bool = True,
+        verify_attestation: bool = True,
     ):
         self.admin_api_key = admin_api_key
         self.pool_size = pool_size
@@ -43,6 +47,7 @@ class ContainerManager:
         self.config_repo = config_repo
         self.config_tag = config_tag
         self.debug_mode = debug_mode
+        self.verify_attestation = verify_attestation
 
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
@@ -53,6 +58,7 @@ class ContainerManager:
         self._fail_count: int = 0
         self._api_errors: int = 0
         self._shutting_down: bool = False
+        self._http_clients: dict[str, httpx.Client] = {}  # container id -> attested client
 
     # ------------------------------------------------------------------
     # Controlplane API
@@ -126,6 +132,38 @@ class ContainerManager:
         self._api_request("DELETE", f"/api/containers/{container_id}")
 
     # ------------------------------------------------------------------
+    # Attestation
+    # ------------------------------------------------------------------
+
+    def _create_attested_client(self, rec: ContainerRecord) -> httpx.Client:
+        """Return an httpx.Client for the container.
+
+        If verify_attestation is True, the client pins the enclave's TLS public
+        key after verifying its attestation. Otherwise, returns a plain client
+        with default CA verification (no enclave attestation).
+        """
+        if not self.verify_attestation:
+            print(f"orchestrator: skipping attestation for {rec.name} ({rec.domain})")
+            return httpx.Client(follow_redirects=True)
+        sc = SecureClient(rec.domain, self.config_repo)
+        client = sc.make_secure_http_client()
+        print(f"orchestrator: attestation verified for {rec.name} ({rec.domain})")
+        return client
+
+    def _get_http_client(self, rec: ContainerRecord) -> httpx.Client:
+        """Get the attested httpx.Client for a container, or raise."""
+        client = self._http_clients.get(rec.id)
+        if client is None:
+            raise RuntimeError(f"no attested client for container {rec.name}")
+        return client
+
+    def _close_http_client(self, container_id: str) -> None:
+        """Close and remove the cached httpx.Client for a container."""
+        client = self._http_clients.pop(container_id, None)
+        if client:
+            client.close()
+
+    # ------------------------------------------------------------------
     # Pool management
     # ------------------------------------------------------------------
 
@@ -157,9 +195,16 @@ class ContainerManager:
         for rec in to_poll:
             status = self._poll_container(rec.id)
             if status == "ready":
-                rec.status = "ready"
-                ready.append(rec)
-                print(f"orchestrator: container {rec.name} is ready")
+                # Verify attestation before marking as ready
+                try:
+                    client = self._create_attested_client(rec)
+                    self._http_clients[rec.id] = client
+                    rec.status = "ready"
+                    ready.append(rec)
+                    print(f"orchestrator: container {rec.name} is ready")
+                except Exception as e:
+                    print(f"orchestrator: attestation failed for {rec.name}: {e}")
+                    failed.append(rec)
             elif status == "failed":
                 failed.append(rec)
                 print(f"orchestrator: container {rec.name} failed")
@@ -264,6 +309,7 @@ class ContainerManager:
             rec = self._sessions.pop(session_id, None)
         if rec:
             rec.status = "deleting"
+            self._close_http_client(rec.id)
             print(f"orchestrator: cleaning up {rec.name} for session {session_id}")
             threading.Thread(
                 target=self._delete_container, args=(rec.id,), daemon=True
@@ -282,6 +328,8 @@ class ContainerManager:
             self._inflight.clear()
             self._sessions.clear()
             self._failed.clear()
+        for rec in all_recs:
+            self._close_http_client(rec.id)
         deleted = []
         skipped = []
         for rec in all_recs:
@@ -330,6 +378,8 @@ class ContainerManager:
             self._inflight.clear()
             self._sessions.clear()
             self._failed.clear()
+        for rec in all_recs:
+            self._close_http_client(rec.id)
         deleted = []
         for rec in all_recs:
             status_code, remote = self._api_request("GET", f"/api/containers/{rec.id}")
@@ -346,21 +396,21 @@ class ContainerManager:
     # Container proxy
     # ------------------------------------------------------------------
 
-    def _proxy(self, domain: str, path: str, body: bytes) -> tuple[int, bytes]:
-        """Proxy a request to a container's api-server over HTTPS."""
-        url = f"https://{domain}{path}"
-        req = urllib.request.Request(
-            url,
-            data=body,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
+    def _proxy(self, rec: ContainerRecord, path: str, body: bytes) -> tuple[int, bytes]:
+        """Proxy a request to a container's api-server over attested HTTPS."""
+        url = f"https://{rec.domain}{path}"
+        client = self._get_http_client(rec)
         try:
-            with urllib.request.urlopen(req, timeout=35, context=_ssl_ctx) as resp:
-                return resp.status, resp.read()
-        except urllib.error.HTTPError as e:
-            return e.code, e.read()
-        except urllib.error.URLError as e:
+            resp = client.post(
+                url,
+                content=body,
+                headers={"Content-Type": "application/json"},
+                timeout=35,
+            )
+            return resp.status_code, resp.content
+        except httpx.HTTPStatusError as e:
+            return e.response.status_code, e.response.content
+        except httpx.HTTPError as e:
             return 502, json.dumps({"error": f"container unavailable: {e}"}).encode()
 
     # ------------------------------------------------------------------
@@ -373,7 +423,7 @@ class ContainerManager:
         if rec is None:
             return {"error": err}
         status, raw = self._proxy(
-            rec.domain, "/exec", json.dumps({"command": command}).encode()
+            rec, "/exec", json.dumps({"command": command}).encode()
         )
         try:
             return json.loads(raw)
@@ -389,7 +439,7 @@ class ContainerManager:
         if rec is None:
             raise RuntimeError(err)
         _status, raw = self._proxy(
-            rec.domain, "/read", json.dumps({"path": path}).encode()
+            rec, "/read", json.dumps({"path": path}).encode()
         )
         result = json.loads(raw)
         if "error" in result:
@@ -403,7 +453,7 @@ class ContainerManager:
         if rec is None:
             return {"error": err}
         status, raw = self._proxy(
-            rec.domain,
+            rec,
             "/write",
             json.dumps({"path": path, "contents": encoded}).encode(),
         )

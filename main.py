@@ -29,6 +29,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "2"))
 CONFIG_REPO = os.environ.get("CONFIG_REPO", "tinfoilsh/code-execution-environment")
 CONFIG_TAG = os.environ.get("CONFIG_TAG", "v0.0.6")
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "true").lower() == "true"
+VERIFY_ATTESTATION = os.environ.get("VERIFY_ATTESTATION", "false").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +119,7 @@ def make_handler(manager: ContainerManager):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print(
-        f"orchestrator: pool_size={POOL_SIZE} max_containers={MAX_CONTAINERS} poll_interval={POLL_INTERVAL}s debug={DEBUG_MODE}"
+        f"orchestrator: pool_size={POOL_SIZE} max_containers={MAX_CONTAINERS} poll_interval={POLL_INTERVAL}s debug={DEBUG_MODE} verify_attestation={VERIFY_ATTESTATION}"
     )
     print(f"orchestrator: repo={CONFIG_REPO} tag={CONFIG_TAG}")
 
@@ -130,6 +131,7 @@ if __name__ == "__main__":
         config_repo=CONFIG_REPO,
         config_tag=CONFIG_TAG,
         debug_mode=DEBUG_MODE,
+        verify_attestation=VERIFY_ATTESTATION,
     )
     manager.start_pool_manager()
 
