@@ -1,12 +1,13 @@
 // Orchestrator entry point.
 //
 // Thin HTTP server that routes:
-//   POST /mcp        → MCP handler (primary tool interface)
-//   GET  /health     → health check
-//   GET  /metrics    → detailed metrics for viz.py
-//   POST /cleanup    → release a single session
-//   POST /delete-all → delete all containers
-//   POST /finish     → delete all + shutdown
+//
+//	POST /mcp        → MCP handler (primary tool interface)
+//	GET  /health     → health check
+//	GET  /metrics    → detailed metrics for viz.py
+//	POST /cleanup    → release a single session
+//	POST /delete-all → delete all containers
+//	POST /finish     → delete all + shutdown
 package main
 
 import (
@@ -15,7 +16,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 )
 
@@ -60,7 +63,7 @@ func main() {
 		MaxContainers:     envInt("MAX_CONTAINERS", 10),
 		PollInterval:      time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
 		ConfigRepo:        envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
-		ConfigTag:         envStr("CONFIG_TAG", "v0.0.6"),
+		ConfigTag:         envStr("CONFIG_TAG", "v0.0.7"),
 		DebugMode:         envBool("DEBUG_MODE", true),
 		VerifyAttestation: envBool("VERIFY_ATTESTATION", false),
 	}
@@ -123,6 +126,18 @@ func main() {
 		}
 		writeJSON(w, status, resp)
 	})
+
+	// On SIGINT/SIGTERM, run Finish() to delete all containers, then shut down.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		log.Println("orchestrator: caught signal, finalizing...")
+		mgr.Finish()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
 
 	log.Printf("orchestrator listening on :%d", port)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

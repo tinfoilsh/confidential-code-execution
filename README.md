@@ -2,90 +2,100 @@
 
 ## Orchestrator
 
-Manages a warm pool of executor containers via the Tinfoil controlplane API. Routes requests by session ID so each client gets an isolated sandbox.
+Manages a warm pool of executor containers via the Tinfoil controlplane API. Routes requests by session ID so each client gets an isolated sandbox. The primary tool interface is MCP (`POST /mcp`).
 
-Stdlib only (+ `dotenv`). Uses `ThreadingHTTPServer` — one thread per request so slow `/exec` calls or pool-empty waits don't block others.
+Written in Go. Stdlib only + `github.com/tinfoilsh/verifier` for enclave attestation.
 
 ### Run
 
 ```bash
 export ADMIN_API_KEY="..."
-python orchestrator/main.py
+go run .
 ```
+
+Or build a binary:
+
+```bash
+go build -o orchestrator .
+./orchestrator
+```
+
+### Environment variables
+
+| Variable             | Default                                | Notes                                                                         |
+| -------------------- | -------------------------------------- | ----------------------------------------------------------------------------- |
+| `ADMIN_API_KEY`      | _(required)_                           | Tinfoil controlplane bearer token                                             |
+| `POOL_SIZE`          | `3`                                    | Target warm pool size                                                         |
+| `MAX_CONTAINERS`     | `10`                                   | Hard cap on concurrent containers                                             |
+| `PORT`               | `7070`                                 | Orchestrator listen port                                                      |
+| `POLL_INTERVAL`      | `2`                                    | Seconds between controlplane polls                                            |
+| `CONFIG_REPO`        | `tinfoilsh/code-execution-environment` | Image repo                                                                    |
+| `CONFIG_TAG`         | `v0.0.6`                               | Image tag                                                                     |
+| `DEBUG_MODE`         | `true`                                 | Pass `debug=true` to controlplane (enables SSH, modifies measurement)         |
+| `VERIFY_ATTESTATION` | `false`                                | Verify enclave attestation + pin TLS public key. Requires `DEBUG_MODE=false`. |
 
 ### API
 
+All tool access is through the single MCP endpoint. The session ID comes from the `X-Session-Id` header.
+
 ```
-POST /exec
-{"sessionId": "abc", "command": "echo hello"}
--> {"stdout": "hello\n", "stderr": "", "exit_code": 0}
+POST /mcp
+Headers: X-Session-Id: <id>
+Body: JSON-RPC 2.0
 
-POST /read
-{"sessionId": "abc", "path": "/workspace/file.txt"}
--> {"path": "/workspace/file.txt", "contents": "<base64>"}
+Methods:
+  initialize       — handshake
+  tools/list       — list available tools
+  tools/call       — invoke a tool (params: {name, arguments})
 
-POST /write
-{"sessionId": "abc", "path": "/workspace/file.txt", "contents": "<base64>"}
--> {"path": "/workspace/file.txt", "size": 42}
+Tools: bash, view, str_replace, create, insert
+```
 
-POST /cleanup
-{"sessionId": "abc"}
--> {"status": "cleaned up", "container": "daniel-exec-a1b2c3d4"}
+Admin endpoints:
 
-POST /delete-all   — delete all tracked containers (with name verification)
-POST /finish       — delete all containers and shut down the server
-
-GET /health        — pool counts
-GET /metrics       — full container details (used by viz.py)
+```
+GET  /health        — pool counts
+GET  /metrics       — full container details (used by viz.py)
+POST /cleanup       {"sessionId": "abc"}  — release a single session
+POST /delete-all    — delete all tracked containers (with name verification)
+POST /finish        — delete all containers and shut down the server
 ```
 
 ### Visualizer
 
 ```bash
-python orchestrator/viz.py
+python viz.py
 ```
 
 Polls `/metrics` every second. Shows warm pool (green), inflight (yellow), active sessions (cyan), and failures (red).
 
 ### Agent
 
-`agent.py` is a minimal implementation that defines our code execution tools - bash & text editor - and usese tinfoils inference to make a very simple agent loop to test out code execution.
-
-## Test
+`agent.py` defines our code-execution tools (bash & text editor) and runs a simple agent loop against Tinfoil inference to exercise the orchestrator end-to-end.
 
 ```bash
-docker exec -it code-executor bash
+export TF_API_KEY="..."
+python agent.py
 ```
-
-```bash
-curl -X POST http://localhost:8000/exec \
-  -H "Content-Type: application/json" \
-  -d '{
-    "command": "echo hello > /workspace/hello.txt\ncat /workspace/hello.txt"
-  }'
-```
-
-Should see:
-`{"stdout": "hello\n", "stderr": "", "exit_code": 0}`
 
 ## Environment Container
 
 _in code-execution-environment repo_
 
 - **api-server** (port 8000) — HTTP API exposed via the Tinfoil shim. Proxies requests to the executor.
-- **executor** (port 9000) — Runs bash comamnds w/ subprocess run
+- **executor** (port 9000) — Runs bash commands and serves file read/write.
 
 ### API
 
 ```
-POST /exec
-{"command": "echo hello"}
+POST /exec   {"command": "echo hello"}
+             → {"stdout": "hello\n", "stderr": "", "exit_code": 0}
 
-Response:
-{"stdout": "hello\n", "stderr": "", "exit_code": 0}
-```
+POST /read   {"path": "/workspace/file.txt"}
+             → {"path": "...", "contents": "<base64>"}
 
-```
-GET /health
-{"status": "ok"}
+POST /write  {"path": "...", "contents": "<base64>"}
+             → {"path": "...", "size": 42}
+
+GET  /health → {"status": "ok"}
 ```
