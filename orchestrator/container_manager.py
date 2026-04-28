@@ -29,11 +29,11 @@ class ContainerManager:
     def __init__(
         self,
         admin_api_key: str,
+        config_repo: str,
+        config_tag: str,
         pool_size: int = 3,
         max_containers: int = 10,
         poll_interval: int = 2,
-        config_repo: str = "tinfoilsh/confidential-code-execution",
-        config_tag: str = "v0.0.5",
         debug_mode: bool = True,
     ):
         self.admin_api_key = admin_api_key
