@@ -4,3 +4,7 @@ __pycache__
 .env
 
 logs/
+
+# Go binaries
+/confidential-code-execution
+/orchestrator

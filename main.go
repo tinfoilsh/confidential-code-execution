@@ -1,0 +1,131 @@
+// Orchestrator entry point.
+//
+// Thin HTTP server that routes:
+//   POST /mcp        → MCP handler (primary tool interface)
+//   GET  /health     → health check
+//   GET  /metrics    → detailed metrics for viz.py
+//   POST /cleanup    → release a single session
+//   POST /delete-all → delete all containers
+//   POST /finish     → delete all + shutdown
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+)
+
+func envStr(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v, ok := os.LookupEnv(key); ok {
+		return v == "true" || v == "1" || v == "True" || v == "TRUE"
+	}
+	return def
+}
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func main() {
+	adminAPIKey := os.Getenv("ADMIN_API_KEY")
+	if adminAPIKey == "" {
+		log.Fatal("ADMIN_API_KEY is required")
+	}
+
+	cfg := ManagerConfig{
+		AdminAPIKey:       adminAPIKey,
+		PoolSize:          envInt("POOL_SIZE", 3),
+		MaxContainers:     envInt("MAX_CONTAINERS", 10),
+		PollInterval:      time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
+		ConfigRepo:        envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
+		ConfigTag:         envStr("CONFIG_TAG", "v0.0.6"),
+		DebugMode:         envBool("DEBUG_MODE", true),
+		VerifyAttestation: envBool("VERIFY_ATTESTATION", false),
+	}
+	port := envInt("PORT", 7070)
+
+	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v debug=%v verify_attestation=%v",
+		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.DebugMode, cfg.VerifyAttestation)
+	log.Printf("orchestrator: repo=%s tag=%s", cfg.ConfigRepo, cfg.ConfigTag)
+
+	mgr := NewManager(cfg)
+	mgr.StartPoolManager()
+
+	mux := http.NewServeMux()
+	srv := &http.Server{Addr: ":" + strconv.Itoa(port), Handler: mux}
+
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, mgr.HealthInfo())
+	})
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, mgr.MetricsInfo())
+	})
+	mux.HandleFunc("/cleanup", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			SessionID string `json:"sessionId"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if body.SessionID == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sessionId is required"})
+			return
+		}
+		c := mgr.CleanupSession(body.SessionID)
+		if c == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no session found for " + body.SessionID})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "cleaned up", "container": c.Name})
+	})
+	mux.HandleFunc("/delete-all", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, mgr.CleanupAll())
+	})
+	mux.HandleFunc("/finish", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, mgr.Finish())
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			srv.Shutdown(ctx)
+		}()
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		var req jsonRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		status, resp := HandleMCPRequest(mgr, r.Header, req)
+		if resp == nil {
+			w.WriteHeader(status)
+			return
+		}
+		writeJSON(w, status, resp)
+	})
+
+	log.Printf("orchestrator listening on :%d", port)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
+}
