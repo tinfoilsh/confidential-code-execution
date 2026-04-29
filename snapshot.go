@@ -42,17 +42,24 @@ type ctxKey int
 const (
 	ctxKeyPubkey ctxKey = iota
 	ctxKeyResumeDEK
+	ctxKeyBearer
 )
 
-// WithSessionAttrs returns a child context carrying the user pubkey and
-// (optional) resume DEK. Empty values are not stored, so GetOrAssign
-// will see them as absent.
-func WithSessionAttrs(ctx context.Context, pubkey, resumeDEK string) context.Context {
+// WithSessionAttrs returns a child context carrying the user pubkey,
+// optional resume DEK, and the user's bearer token. Empty values are
+// not stored, so callers downstream (GetOrAssign, restoreInto) see
+// them as absent. The bearer is used for the snapshot GET on the
+// restore-on-assign path — controlplane requires a fresh user JWT
+// for reads, which we have during a live tool/call request.
+func WithSessionAttrs(ctx context.Context, pubkey, resumeDEK, bearer string) context.Context {
 	if pubkey != "" {
 		ctx = context.WithValue(ctx, ctxKeyPubkey, pubkey)
 	}
 	if resumeDEK != "" {
 		ctx = context.WithValue(ctx, ctxKeyResumeDEK, resumeDEK)
+	}
+	if bearer != "" {
+		ctx = context.WithValue(ctx, ctxKeyBearer, bearer)
 	}
 	return ctx
 }
@@ -64,6 +71,11 @@ func sessionPubkey(ctx context.Context) string {
 
 func sessionResumeDEK(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeyResumeDEK).(string)
+	return v
+}
+
+func sessionBearer(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyBearer).(string)
 	return v
 }
 
@@ -100,12 +112,11 @@ func decryptSnapshotTar(dek, ciphertext []byte) ([]byte, error) {
 	return plain, nil
 }
 
-// onBehalfOfHeader returns the X-On-Behalf-Of header set the
-// controlplane snapshot endpoints expect from admin-authed callers.
-// Empty when no Clerk user is bound (which shouldn't happen in
-// production: AuthorizeSession rejects non-Clerk traffic before a
-// container is assigned. Empty here means the call is from a path
-// that never went through MCP — most likely a test).
+// onBehalfOfHeader formats the X-On-Behalf-Of header set on
+// admin-authed snapshot PUTs. Empty when no Clerk user is bound (which
+// shouldn't happen in production: AuthorizeSession rejects non-Clerk
+// traffic before a container is assigned. Empty here means the call
+// is from a path that never went through MCP — most likely a test).
 func onBehalfOfHeader(clerkUserID string) map[string]string {
 	if clerkUserID == "" {
 		return nil
@@ -115,20 +126,35 @@ func onBehalfOfHeader(clerkUserID string) map[string]string {
 
 // fetchSnapshotBundle pulls the full {ciphertext, wrappedDEK} bundle for
 // the given execSessionId from controlplane. Returns (nil, nil) if no
-// bundle exists (404) so the caller can treat that as "fresh container".
+// bundle exists (404).
 //
-// clerkUserID is forwarded as X-On-Behalf-Of so the controlplane scopes
-// the row to the right user even though we authenticate as admin.
-func (m *Manager) fetchSnapshotBundle(execSessionID, clerkUserID string) (*snapshotBundle, error) {
-	status, raw, err := m.apiRequestWithHeaders("GET", "/api/storage/exec-snapshot/"+execSessionID, nil, onBehalfOfHeader(clerkUserID))
+// Uses the user's bearer JWT — controlplane scopes GETs by the JWT
+// subject and rejects admin-authed reads. This works because GETs only
+// run during a live tool/call request, when the user's JWT is fresh.
+// Empty bearer means we're in a test path that never went through MCP;
+// we still issue the request so existing tests against fake
+// controlplanes (which don't enforce auth) keep working.
+func (m *Manager) fetchSnapshotBundle(ctx context.Context, execSessionID, bearer string) (*snapshotBundle, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", apiBase+"/api/storage/exec-snapshot/"+execSessionID, nil)
 	if err != nil {
 		return nil, err
 	}
-	if status == http.StatusNotFound {
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
+
+	resp, err := m.apiClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
 	}
-	if status >= 400 {
-		return nil, fmt.Errorf("controlplane GET snapshot %s: %d %s", execSessionID, status, string(raw))
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("controlplane GET snapshot %s: %d %s", execSessionID, resp.StatusCode, string(raw))
 	}
 	var b snapshotBundle
 	if err := json.Unmarshal(raw, &b); err != nil {
@@ -138,7 +164,8 @@ func (m *Manager) fetchSnapshotBundle(execSessionID, clerkUserID string) (*snaps
 }
 
 // putSnapshotBundle uploads {ciphertext, wrappedDEK} to controlplane,
-// attributing the row to clerkUserID via X-On-Behalf-Of.
+// attributing the row to clerkUserID via X-On-Behalf-Of. Admin-authed:
+// PUTs run from the eviction loop, long after the user's JWT expired.
 func (m *Manager) putSnapshotBundle(execSessionID, clerkUserID string, b *snapshotBundle) error {
 	status, raw, err := m.apiRequestWithHeaders("PUT", "/api/storage/exec-snapshot/"+execSessionID, b, onBehalfOfHeader(clerkUserID))
 	if err != nil {

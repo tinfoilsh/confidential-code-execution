@@ -471,7 +471,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected
 	// workspace — better than refusing to assign and breaking the user's
 	// chat entirely. (The webapp can surface a "restore failed" hint.)
 	if dek := sessionResumeDEK(ctx); dek != "" {
-		if err := m.restoreInto(sessionID, c, dek); err != nil {
+		if err := m.restoreInto(ctx, sessionID, c, dek); err != nil {
 			log.Printf("orchestrator: restore failed for session %s on %s: %v (continuing with empty workspace)",
 				sessionID, c.Name, err)
 		} else {
@@ -495,12 +495,12 @@ func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected
 // the container's /restore. No-op if the controlplane has no bundle for
 // this session (returns nil; we just keep the empty workspace).
 //
-// The session is expected to already be bound to a Clerk user (the MCP
-// boundary calls AuthorizeSession before any GetOrAssign), so we look
-// up the bound user here for X-On-Behalf-Of. Empty user → no header,
-// which only happens on test paths that bypass MCP.
-func (m *Manager) restoreInto(sessionID string, c *Container, resumeDEKb64 string) error {
-	bundle, err := m.fetchSnapshotBundle(sessionID, m.SessionIdentity(sessionID))
+// The controlplane GET requires a fresh user JWT; we read it off ctx
+// (stamped by the MCP handler from the live request's Authorization
+// header). Empty bearer only happens on test paths that bypass MCP,
+// which run against fake controlplanes that don't enforce auth.
+func (m *Manager) restoreInto(ctx context.Context, sessionID string, c *Container, resumeDEKb64 string) error {
+	bundle, err := m.fetchSnapshotBundle(ctx, sessionID, sessionBearer(ctx))
 	if err != nil {
 		return fmt.Errorf("fetch bundle: %w", err)
 	}

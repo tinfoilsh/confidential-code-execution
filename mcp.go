@@ -85,9 +85,12 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		// can wrap the DEK to it. X-Exec-Resume-Dek, when present, tells
 		// GetOrAssign to fetch + decrypt + push the snapshot tar into the
 		// fresh container's /restore before the first tool call exposes it.
+		// The bearer rides along too — restoreInto needs it to JWT-auth
+		// the snapshot GET against controlplane (admin GETs are rejected).
 		ctx = WithSessionAttrs(ctx,
 			headers.Get("X-Exec-Pubkey"),
-			headers.Get("X-Exec-Resume-Dek"))
+			headers.Get("X-Exec-Resume-Dek"),
+			bearer)
 		name, _ := req.Params["name"].(string)
 		args, _ := req.Params["arguments"].(map[string]any)
 		handler, ok := ToolHandlers[name]

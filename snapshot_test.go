@@ -278,7 +278,7 @@ func TestRestoreOnAssign(t *testing.T) {
 	m.warmPool = []*Container{c}
 
 	ctx := WithSessionAttrs(context.Background(),
-		"cGstYjY0", base64.StdEncoding.EncodeToString(dek))
+		"cGstYjY0", base64.StdEncoding.EncodeToString(dek), "")
 
 	got, errMsg := m.GetOrAssign(ctx, "sess-1", nil)
 	if got == nil {
