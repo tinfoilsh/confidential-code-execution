@@ -47,7 +47,11 @@ var Tools = []ToolSchema{
 	},
 	{
 		Name:        "present",
-		Description: "Render a file's contents to the user as a syntax-highlighted code block in the chat. The model receives only an acknowledgement; the file's contents are not echoed back as a tool result. Use this to show the user a file (logs, source, generated artifact) without re-typing it. Same arguments as view.",
+		Description: "Show a file to the user. The file is rendered directly in the chat as a syntax-highlighted code block, exactly as if you had pasted it inline. " +
+			"You will receive the file's contents back as the tool result so you can keep working with it, but the user has ALREADY SEEN the full file by the time this tool returns. " +
+			"After calling present, do NOT re-paste, restate, summarize, or quote the file's contents in your reply — the user is looking at it. " +
+			"Brief commentary about the file (e.g. \"here's foo.py — note the bug on line 12\") is fine; reproducing any portion of the file is not. " +
+			"Prefer present over pasting file contents in your response. Same arguments as view.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

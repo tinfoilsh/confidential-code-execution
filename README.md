@@ -48,7 +48,7 @@ Methods:
   tools/list       — list available tools
   tools/call       — invoke a tool (params: {name, arguments})
 
-Tools: bash, view, str_replace, create, insert
+Tools: bash, view, present, str_replace, create, insert
 ```
 
 Admin endpoints:
