@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 )
 
@@ -25,7 +26,12 @@ type rpcError struct {
 
 // HandleMCPRequest processes a JSON-RPC 2.0 MCP request.
 // Returns (status, response). If response is nil, the request was a notification.
-func HandleMCPRequest(m *Manager, headers http.Header, req jsonRPCRequest) (int, *jsonRPCResponse) {
+//
+// ctx is the per-request context — pass r.Context() from the HTTP handler.
+// Per-session attrs (pubkey, resume DEK) are stamped onto a child context
+// via WithSessionAttrs and read back at the GetOrAssign call site, so
+// they live exactly as long as the request goroutine.
+func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req jsonRPCRequest) (int, *jsonRPCResponse) {
 	// Notifications have no id
 	if req.ID == nil {
 		return http.StatusAccepted, nil
@@ -55,18 +61,14 @@ func HandleMCPRequest(m *Manager, headers http.Header, req jsonRPCRequest) (int,
 			resp.Error = &rpcError{Code: -32602, Message: "X-Session-Id header is required"}
 			return http.StatusBadRequest, resp
 		}
-		// Cache per-session attributes BEFORE the tool handler runs.
-		// X-Exec-Pubkey is required for snapshotting at eviction time
-		// (we wrap the DEK to it), and X-Exec-Resume-Dek — when present
-		// — tells GetOrAssign to fetch + decrypt + push the snapshot
-		// tar into the fresh container's /restore before the first
-		// tool call exposes it. Both are stashed via RegisterSession;
-		// any subsequent GetOrAssign call in this request picks them up.
-		m.RegisterSession(
-			sessionID,
+		// Stash per-request attrs on ctx. X-Exec-Pubkey is what
+		// GetOrAssign stamps onto c.Pubkey so eviction-time snapshotting
+		// can wrap the DEK to it. X-Exec-Resume-Dek, when present, tells
+		// GetOrAssign to fetch + decrypt + push the snapshot tar into the
+		// fresh container's /restore before the first tool call exposes it.
+		ctx = WithSessionAttrs(ctx,
 			headers.Get("X-Exec-Pubkey"),
-			headers.Get("X-Exec-Resume-Dek"),
-		)
+			headers.Get("X-Exec-Resume-Dek"))
 		name, _ := req.Params["name"].(string)
 		args, _ := req.Params["arguments"].(map[string]any)
 		handler, ok := ToolHandlers[name]
@@ -74,7 +76,7 @@ func HandleMCPRequest(m *Manager, headers http.Header, req jsonRPCRequest) (int,
 			resp.Error = &rpcError{Code: -32601, Message: "unknown tool: " + name}
 			return http.StatusBadRequest, resp
 		}
-		text, err := handler(m, sessionID, args)
+		text, err := handler(ctx, m, sessionID, args)
 		if err != nil {
 			resp.Result = map[string]any{
 				"content": []map[string]any{{"type": "text", "text": "Error: " + err.Error()}},

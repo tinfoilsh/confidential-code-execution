@@ -120,7 +120,7 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		status, resp := HandleMCPRequest(mgr, r.Header, req)
+		status, resp := HandleMCPRequest(r.Context(), mgr, r.Header, req)
 		if resp == nil {
 			w.WriteHeader(status)
 			return

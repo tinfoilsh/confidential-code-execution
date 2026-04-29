@@ -21,6 +21,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
@@ -29,6 +30,42 @@ import (
 	"io"
 	"net/http"
 )
+
+// Per-request session attributes are passed down the call chain through
+// context. The MCP boundary reads X-Exec-Pubkey / X-Exec-Resume-Dek from
+// request headers and stashes them here; GetOrAssign reads them back at
+// the assign point. Lifetime is bounded by the request goroutine — when
+// the handler returns, the context is gone, so a stale DEK can't leak
+// into a later request.
+type ctxKey int
+
+const (
+	ctxKeyPubkey ctxKey = iota
+	ctxKeyResumeDEK
+)
+
+// WithSessionAttrs returns a child context carrying the user pubkey and
+// (optional) resume DEK. Empty values are not stored, so GetOrAssign
+// will see them as absent.
+func WithSessionAttrs(ctx context.Context, pubkey, resumeDEK string) context.Context {
+	if pubkey != "" {
+		ctx = context.WithValue(ctx, ctxKeyPubkey, pubkey)
+	}
+	if resumeDEK != "" {
+		ctx = context.WithValue(ctx, ctxKeyResumeDEK, resumeDEK)
+	}
+	return ctx
+}
+
+func sessionPubkey(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyPubkey).(string)
+	return v
+}
+
+func sessionResumeDEK(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyResumeDEK).(string)
+	return v
+}
 
 // snapshotBundle is what we PUT to and GET from the controlplane.
 // Same shape as the executor's snapshotResponse.

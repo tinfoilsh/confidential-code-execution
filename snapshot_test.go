@@ -17,6 +17,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -276,9 +277,10 @@ func TestRestoreOnAssign(t *testing.T) {
 	// pulls it and runs restore.
 	m.warmPool = []*Container{c}
 
-	m.RegisterSession("sess-1", "cGstYjY0", base64.StdEncoding.EncodeToString(dek))
+	ctx := WithSessionAttrs(context.Background(),
+		"cGstYjY0", base64.StdEncoding.EncodeToString(dek))
 
-	got, errMsg := m.GetOrAssign("sess-1", nil)
+	got, errMsg := m.GetOrAssign(ctx, "sess-1", nil)
 	if got == nil {
 		t.Fatalf("GetOrAssign failed: %s", errMsg)
 	}
@@ -291,13 +293,6 @@ func TestRestoreOnAssign(t *testing.T) {
 	}
 	if got.Pubkey != "cGstYjY0" {
 		t.Fatalf("pubkey not cached on container: %q", got.Pubkey)
-	}
-	// Resume DEK should have been consumed.
-	m.mu.Lock()
-	a := m.attrs["sess-1"]
-	m.mu.Unlock()
-	if a == nil || a.ResumeDEK != "" {
-		t.Fatalf("ResumeDEK should be cleared after use, got %+v", a)
 	}
 }
 
@@ -367,7 +362,7 @@ func TestPerSessionSerialization(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			got, _ := m.GetOrAssign("shared-session", nil)
+			got, _ := m.GetOrAssign(context.Background(), "shared-session", nil)
 			results[idx] = got
 		}(i)
 	}

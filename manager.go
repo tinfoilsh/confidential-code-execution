@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -38,20 +39,6 @@ type Container struct {
 	LastActivity time.Time
 }
 
-// SessionAttrs holds per-session state that the orchestrator needs but
-// that doesn't belong on the Container itself: the resume DEK (only set
-// during the brief cold-resume window) and the user pubkey (kept for
-// the lifetime of the session for eviction-time snapshotting).
-type SessionAttrs struct {
-	// Pubkey is base64url-encoded raw 32-byte X25519. Always present
-	// for authenticated code-exec sessions.
-	Pubkey string
-	// ResumeDEK is the unwrapped 32-byte DEK, base64-encoded (we accept
-	// std or url, decoded leniently). Only present on a cold resume —
-	// once we've used it for restore we drop it.
-	ResumeDEK string
-}
-
 type ManagerConfig struct {
 	AdminAPIKey       string
 	PoolSize          int
@@ -77,8 +64,7 @@ type Manager struct {
 	warmPool     []*Container
 	inflight     []*Container
 	sessions     map[string]*Container
-	attrs        map[string]*SessionAttrs // execSessionID -> cached pubkey + (transient) resume DEK
-	assignLocks  map[string]*sync.Mutex   // per-execSessionID serialization, see lockSession
+	assignLocks  map[string]*sync.Mutex // per-execSessionID serialization, see lockSession
 	failed       []*Container
 	failCount    int
 	apiErrors    int
@@ -97,7 +83,6 @@ func NewManager(cfg ManagerConfig) *Manager {
 	m := &Manager{
 		cfg:         cfg,
 		sessions:    map[string]*Container{},
-		attrs:       map[string]*SessionAttrs{},
 		assignLocks: map[string]*sync.Mutex{},
 		apiClient:   &http.Client{Timeout: 30 * time.Second},
 	}
@@ -121,36 +106,6 @@ func (m *Manager) lockSession(sessionID string) *sync.Mutex {
 	l := &sync.Mutex{}
 	m.assignLocks[sessionID] = l
 	return l
-}
-
-// RegisterSession caches per-session attributes (pubkey, resume DEK) sent
-// on the request that triggered the tool call. This is a separate step
-// from GetOrAssign because GetOrAssign is also called from internal
-// helpers (ReadFile, WriteFile) that don't carry headers — we want the
-// MCP layer to set attrs once per request, then any subsequent
-// GetOrAssign calls in the same request pick them up.
-//
-// pubkey is required (it's how the eviction-time snapshot can wrap the
-// DEK). resumeDEK is optional — only set on a cold resume.
-func (m *Manager) RegisterSession(sessionID, pubkey, resumeDEK string) {
-	if sessionID == "" {
-		return
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	a, ok := m.attrs[sessionID]
-	if !ok {
-		a = &SessionAttrs{}
-		m.attrs[sessionID] = a
-	}
-	if pubkey != "" {
-		a.Pubkey = pubkey
-	}
-	// Only overwrite ResumeDEK if a fresh one is provided. Once consumed
-	// during restore we'll clear it explicitly.
-	if resumeDEK != "" {
-		a.ResumeDEK = resumeDEK
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -441,20 +396,28 @@ func (m *Manager) poolManagerLoop() {
 // sees the in-memory hit and shares the same container. This prevents
 // double-assignment and double-restore.
 //
-// Restore-on-assign: if RegisterSession set a ResumeDEK for this session
-// and the controlplane has a snapshot bundle, we fetch the bundle, decrypt
-// the tar with the DEK, and POST the plaintext to the container's
-// /restore endpoint BEFORE returning the container to the caller. The
-// executor closes its restore gate on the first non-/restore call, so
-// this is the only safe point to do it.
-func (m *Manager) GetOrAssign(sessionID string, isConnected func() bool) (*Container, string) {
+// Per-request attrs are read from ctx (see WithSessionAttrs):
+//   - Pubkey is stamped onto c.Pubkey so the eviction loop can wrap a
+//     snapshot to it long after the request returns. We refresh on every
+//     call so a key rotation mid-session is picked up.
+//   - ResumeDEK, when present and the controlplane has a bundle, drives
+//     a fetch + decrypt + POST to the container's /restore BEFORE the
+//     container is returned. The executor closes its restore gate on the
+//     first non-/restore call, so this is the only safe point. The DEK
+//     never outlives the request — it lives on ctx and disappears with it.
+func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected func() bool) (*Container, string) {
 	// Take the per-session lock first. This is the serialization point.
 	sl := m.lockSession(sessionID)
 	sl.Lock()
 	defer sl.Unlock()
 
+	pubkey := sessionPubkey(ctx)
+
 	m.mu.Lock()
 	if c, ok := m.sessions[sessionID]; ok {
+		if pubkey != "" {
+			c.Pubkey = pubkey
+		}
 		m.mu.Unlock()
 		return c, ""
 	}
@@ -487,38 +450,21 @@ func (m *Manager) GetOrAssign(sessionID string, isConnected func() bool) (*Conta
 	c.Status = "assigning"
 	c.AssignedAt = time.Now()
 	c.LastActivity = time.Now()
-
-	// Snapshot per-session attrs while holding the global lock so we
-	// don't race with RegisterSession.
-	var attrs SessionAttrs
-	if a, ok := m.attrs[sessionID]; ok {
-		attrs = *a
+	if pubkey != "" {
+		c.Pubkey = pubkey
 	}
 	m.mu.Unlock()
-
-	// Cache the user pubkey on the container so eviction can call
-	// /snapshot with the same key the user is currently sending.
-	if attrs.Pubkey != "" {
-		c.Pubkey = attrs.Pubkey
-	}
 
 	// Restore-on-assign. Failures here log and continue with an empty
 	// workspace — better than refusing to assign and breaking the user's
 	// chat entirely. (The webapp can surface a "restore failed" hint.)
-	if attrs.ResumeDEK != "" {
-		if err := m.restoreInto(sessionID, c, attrs.ResumeDEK); err != nil {
+	if dek := sessionResumeDEK(ctx); dek != "" {
+		if err := m.restoreInto(sessionID, c, dek); err != nil {
 			log.Printf("orchestrator: restore failed for session %s on %s: %v (continuing with empty workspace)",
 				sessionID, c.Name, err)
 		} else {
 			log.Printf("orchestrator: restored snapshot for session %s onto %s", sessionID, c.Name)
 		}
-		// Drop the resume DEK regardless — it's single-use and we don't
-		// want it sitting in memory if the next request retries.
-		m.mu.Lock()
-		if a, ok := m.attrs[sessionID]; ok {
-			a.ResumeDEK = ""
-		}
-		m.mu.Unlock()
 	}
 
 	// Mark assigned only AFTER restore so the eviction loop can't trip
@@ -587,7 +533,6 @@ func (m *Manager) CleanupSession(sessionID string) *Container {
 	if ok {
 		delete(m.sessions, sessionID)
 	}
-	delete(m.attrs, sessionID)
 	delete(m.assignLocks, sessionID)
 	m.mu.Unlock()
 	if !ok {
@@ -658,12 +603,11 @@ func (m *Manager) evictIdleSessions() {
 		}
 	}
 	for _, t := range targets {
+		// Drop the session entry but keep the assign lock to serialize
+		// against any in-flight GetOrAssign for the same session: a
+		// request arriving mid-eviction either sees the deletion and
+		// assigns a fresh container, or queues behind the evictor cleanly.
 		delete(m.sessions, t.sessionID)
-		// Drop attrs but keep the assign lock to serialize against any
-		// in-flight GetOrAssign for the same session (so a request that
-		// arrives mid-eviction either sees the deletion and assigns a
-		// fresh container, or queues behind the evictor cleanly).
-		delete(m.attrs, t.sessionID)
 	}
 	m.mu.Unlock()
 
@@ -687,7 +631,6 @@ func (m *Manager) CleanupAll() map[string]any {
 	m.warmPool = nil
 	m.inflight = nil
 	m.sessions = map[string]*Container{}
-	m.attrs = map[string]*SessionAttrs{}
 	m.assignLocks = map[string]*sync.Mutex{}
 	m.failed = nil
 	m.mu.Unlock()
@@ -742,8 +685,8 @@ func (m *Manager) proxy(c *Container, path string, body []byte) (int, []byte, er
 }
 
 // ExecCommand runs a bash command in the session's container.
-func (m *Manager) ExecCommand(sessionID, command string) map[string]any {
-	c, errMsg := m.GetOrAssign(sessionID, nil)
+func (m *Manager) ExecCommand(ctx context.Context, sessionID, command string) map[string]any {
+	c, errMsg := m.GetOrAssign(ctx, sessionID, nil)
 	if c == nil {
 		return map[string]any{"error": errMsg}
 	}
@@ -757,8 +700,8 @@ func (m *Manager) ExecCommand(sessionID, command string) map[string]any {
 }
 
 // ReadFile reads a text file from the session's container.
-func (m *Manager) ReadFile(sessionID, path string) (string, error) {
-	c, errMsg := m.GetOrAssign(sessionID, nil)
+func (m *Manager) ReadFile(ctx context.Context, sessionID, path string) (string, error) {
+	c, errMsg := m.GetOrAssign(ctx, sessionID, nil)
 	if c == nil {
 		return "", fmt.Errorf("%s", errMsg)
 	}
@@ -782,8 +725,8 @@ func (m *Manager) ReadFile(sessionID, path string) (string, error) {
 }
 
 // WriteFile writes text content to a file on the session's container.
-func (m *Manager) WriteFile(sessionID, path, content string) map[string]any {
-	c, errMsg := m.GetOrAssign(sessionID, nil)
+func (m *Manager) WriteFile(ctx context.Context, sessionID, path, content string) map[string]any {
+	c, errMsg := m.GetOrAssign(ctx, sessionID, nil)
 	if c == nil {
 		return map[string]any{"error": errMsg}
 	}
@@ -798,8 +741,8 @@ func (m *Manager) WriteFile(sessionID, path, content string) map[string]any {
 }
 
 // FileExists returns true iff the file is readable.
-func (m *Manager) FileExists(sessionID, path string) bool {
-	_, err := m.ReadFile(sessionID, path)
+func (m *Manager) FileExists(ctx context.Context, sessionID, path string) bool {
+	_, err := m.ReadFile(ctx, sessionID, path)
 	return err == nil
 }
 
