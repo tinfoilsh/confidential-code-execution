@@ -55,6 +55,18 @@ func HandleMCPRequest(m *Manager, headers http.Header, req jsonRPCRequest) (int,
 			resp.Error = &rpcError{Code: -32602, Message: "X-Session-Id header is required"}
 			return http.StatusBadRequest, resp
 		}
+		// Cache per-session attributes BEFORE the tool handler runs.
+		// X-Exec-Pubkey is required for snapshotting at eviction time
+		// (we wrap the DEK to it), and X-Exec-Resume-Dek — when present
+		// — tells GetOrAssign to fetch + decrypt + push the snapshot
+		// tar into the fresh container's /restore before the first
+		// tool call exposes it. Both are stashed via RegisterSession;
+		// any subsequent GetOrAssign call in this request picks them up.
+		m.RegisterSession(
+			sessionID,
+			headers.Get("X-Exec-Pubkey"),
+			headers.Get("X-Exec-Resume-Dek"),
+		)
 		name, _ := req.Params["name"].(string)
 		args, _ := req.Params["arguments"].(map[string]any)
 		handler, ok := ToolHandlers[name]

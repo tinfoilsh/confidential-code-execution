@@ -75,6 +75,7 @@ func main() {
 
 	mgr := NewManager(cfg)
 	mgr.StartPoolManager()
+	mgr.StartEvictionLoop()
 
 	mux := http.NewServeMux()
 	srv := &http.Server{Addr: ":" + strconv.Itoa(port), Handler: mux}

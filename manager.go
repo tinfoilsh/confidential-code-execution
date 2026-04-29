@@ -16,7 +16,8 @@ import (
 	"github.com/tinfoilsh/verifier/client"
 )
 
-const apiBase = "https://api.tinfoil.sh"
+// apiBase is the controlplane root for /api/* calls.
+var apiBase = "https://api.tinfoil.sh"
 
 type Container struct {
 	ID         string
@@ -28,6 +29,27 @@ type Container struct {
 	SSHPort    int
 
 	httpClient *http.Client // proxy client (attested or plain)
+
+	// Needed at eviction time to call the container's /snapshot endpoint, which wraps the DEK to it.
+	Pubkey string
+
+	// LastActivity is updated on every successful proxied tool call.
+	// The eviction loop uses it to decide when to snapshot+destroy.
+	LastActivity time.Time
+}
+
+// SessionAttrs holds per-session state that the orchestrator needs but
+// that doesn't belong on the Container itself: the resume DEK (only set
+// during the brief cold-resume window) and the user pubkey (kept for
+// the lifetime of the session for eviction-time snapshotting).
+type SessionAttrs struct {
+	// Pubkey is base64url-encoded raw 32-byte X25519. Always present
+	// for authenticated code-exec sessions.
+	Pubkey string
+	// ResumeDEK is the unwrapped 32-byte DEK, base64-encoded (we accept
+	// std or url, decoded leniently). Only present on a cold resume —
+	// once we've used it for restore we drop it.
+	ResumeDEK string
 }
 
 type ManagerConfig struct {
@@ -39,6 +61,12 @@ type ManagerConfig struct {
 	ConfigTag         string
 	DebugMode         bool
 	VerifyAttestation bool
+	// IdleTimeout is how long a session can have no tool activity before
+	// the orchestrator snapshots and evicts the container.
+	IdleTimeout time.Duration
+	// EvictionPoll is how often the eviction loop wakes up to scan
+	// sessions. Roughly IdleTimeout / 10.
+	EvictionPoll time.Duration
 }
 
 type Manager struct {
@@ -49,6 +77,8 @@ type Manager struct {
 	warmPool     []*Container
 	inflight     []*Container
 	sessions     map[string]*Container
+	attrs        map[string]*SessionAttrs // execSessionID -> cached pubkey + (transient) resume DEK
+	assignLocks  map[string]*sync.Mutex   // per-execSessionID serialization, see lockSession
 	failed       []*Container
 	failCount    int
 	apiErrors    int
@@ -58,13 +88,69 @@ type Manager struct {
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
+	if cfg.IdleTimeout == 0 {
+		cfg.IdleTimeout = 10 * time.Minute
+	}
+	if cfg.EvictionPoll == 0 {
+		cfg.EvictionPoll = 30 * time.Second
+	}
 	m := &Manager{
-		cfg:       cfg,
-		sessions:  map[string]*Container{},
-		apiClient: &http.Client{Timeout: 30 * time.Second},
+		cfg:         cfg,
+		sessions:    map[string]*Container{},
+		attrs:       map[string]*SessionAttrs{},
+		assignLocks: map[string]*sync.Mutex{},
+		apiClient:   &http.Client{Timeout: 30 * time.Second},
 	}
 	m.cond = sync.NewCond(&m.mu)
 	return m
+}
+
+// lockSession returns a mutex specific to execSessionID. Callers should
+// hold it across the read-or-restore-then-assign critical section so that
+// two concurrent webapp tabs hitting GetOrAssign with the same session
+// don't both pull a fresh container from the warm pool. The first one
+// wins; the second sees the in-memory hit and re-uses the assigned
+// container. Locks are kept indefinitely (one per session, cheap) until
+// CleanupSession drops them.
+func (m *Manager) lockSession(sessionID string) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if l, ok := m.assignLocks[sessionID]; ok {
+		return l
+	}
+	l := &sync.Mutex{}
+	m.assignLocks[sessionID] = l
+	return l
+}
+
+// RegisterSession caches per-session attributes (pubkey, resume DEK) sent
+// on the request that triggered the tool call. This is a separate step
+// from GetOrAssign because GetOrAssign is also called from internal
+// helpers (ReadFile, WriteFile) that don't carry headers — we want the
+// MCP layer to set attrs once per request, then any subsequent
+// GetOrAssign calls in the same request pick them up.
+//
+// pubkey is required (it's how the eviction-time snapshot can wrap the
+// DEK). resumeDEK is optional — only set on a cold resume.
+func (m *Manager) RegisterSession(sessionID, pubkey, resumeDEK string) {
+	if sessionID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.attrs[sessionID]
+	if !ok {
+		a = &SessionAttrs{}
+		m.attrs[sessionID] = a
+	}
+	if pubkey != "" {
+		a.Pubkey = pubkey
+	}
+	// Only overwrite ResumeDEK if a fresh one is provided. Once consumed
+	// during restore we'll clear it explicitly.
+	if resumeDEK != "" {
+		a.ResumeDEK = resumeDEK
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +263,11 @@ func (m *Manager) verifyContainerName(c *Container) bool {
 // ---------------------------------------------------------------------------
 
 func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
+	// TODO: flip VERIFY_ATTESTATION to true in prod alongside the snapshot
+	// feature. Default stays false here so local/dev still work without
+	// enclave attestation, but the chained-attestation trust model
+	// (webapp -> router -> orchestrator -> container) requires this on
+	// in production for the resume handshake to be meaningful.
 	if !m.cfg.VerifyAttestation {
 		log.Printf("orchestrator: skipping attestation for %s (%s)", c.Name, c.Domain)
 		return &http.Client{Timeout: 35 * time.Second}, nil
@@ -341,25 +432,45 @@ func (m *Manager) poolManagerLoop() {
 // ---------------------------------------------------------------------------
 
 // GetOrAssign returns an existing session's container or assigns one from
-// the warm pool, blocking up to 60s. ctx is consulted while waiting so a
-// disconnected client can short-circuit.
+// the warm pool, blocking up to 60s. isConnected is consulted while waiting
+// so a disconnected client can short-circuit.
+//
+// Per-execSessionId serialization: two concurrent tabs hitting this with
+// the same session ID race on a per-session mutex (lockSession). Only one
+// of them pulls a fresh container and runs restore; the other waits, then
+// sees the in-memory hit and shares the same container. This prevents
+// double-assignment and double-restore.
+//
+// Restore-on-assign: if RegisterSession set a ResumeDEK for this session
+// and the controlplane has a snapshot bundle, we fetch the bundle, decrypt
+// the tar with the DEK, and POST the plaintext to the container's
+// /restore endpoint BEFORE returning the container to the caller. The
+// executor closes its restore gate on the first non-/restore call, so
+// this is the only safe point to do it.
 func (m *Manager) GetOrAssign(sessionID string, isConnected func() bool) (*Container, string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	// Take the per-session lock first. This is the serialization point.
+	sl := m.lockSession(sessionID)
+	sl.Lock()
+	defer sl.Unlock()
 
+	m.mu.Lock()
 	if c, ok := m.sessions[sessionID]; ok {
+		m.mu.Unlock()
 		return c, ""
 	}
 	if len(m.sessions) >= m.cfg.MaxContainers {
+		m.mu.Unlock()
 		return nil, fmt.Sprintf("at capacity (%d sessions)", m.cfg.MaxContainers)
 	}
 
 	deadline := time.Now().Add(60 * time.Second)
 	for len(m.warmPool) == 0 {
 		if time.Now().After(deadline) {
+			m.mu.Unlock()
 			return nil, "no containers available (timed out after 60s)"
 		}
 		if isConnected != nil && !isConnected() {
+			m.mu.Unlock()
 			log.Printf("orchestrator: client disconnected while waiting for session %s", sessionID)
 			return nil, "client disconnected"
 		}
@@ -373,11 +484,101 @@ func (m *Manager) GetOrAssign(sessionID string, isConnected func() bool) (*Conta
 
 	c := m.warmPool[0]
 	m.warmPool = m.warmPool[1:]
-	c.Status = "assigned"
+	c.Status = "assigning"
 	c.AssignedAt = time.Now()
+	c.LastActivity = time.Now()
+
+	// Snapshot per-session attrs while holding the global lock so we
+	// don't race with RegisterSession.
+	var attrs SessionAttrs
+	if a, ok := m.attrs[sessionID]; ok {
+		attrs = *a
+	}
+	m.mu.Unlock()
+
+	// Cache the user pubkey on the container so eviction can call
+	// /snapshot with the same key the user is currently sending.
+	if attrs.Pubkey != "" {
+		c.Pubkey = attrs.Pubkey
+	}
+
+	// Restore-on-assign. Failures here log and continue with an empty
+	// workspace — better than refusing to assign and breaking the user's
+	// chat entirely. (The webapp can surface a "restore failed" hint.)
+	if attrs.ResumeDEK != "" {
+		if err := m.restoreInto(sessionID, c, attrs.ResumeDEK); err != nil {
+			log.Printf("orchestrator: restore failed for session %s on %s: %v (continuing with empty workspace)",
+				sessionID, c.Name, err)
+		} else {
+			log.Printf("orchestrator: restored snapshot for session %s onto %s", sessionID, c.Name)
+		}
+		// Drop the resume DEK regardless — it's single-use and we don't
+		// want it sitting in memory if the next request retries.
+		m.mu.Lock()
+		if a, ok := m.attrs[sessionID]; ok {
+			a.ResumeDEK = ""
+		}
+		m.mu.Unlock()
+	}
+
+	// Mark assigned only AFTER restore so the eviction loop can't trip
+	// on a half-bootstrapped container.
+	m.mu.Lock()
+	c.Status = "assigned"
 	m.sessions[sessionID] = c
+	m.mu.Unlock()
+
 	log.Printf("orchestrator: assigned %s to session %s", c.Name, sessionID)
 	return c, ""
+}
+
+// restoreInto fetches the snapshot bundle for sessionID, decrypts the tar
+// using the orchestrator-passed resume DEK, and pushes plaintext into
+// the container's /restore. No-op if the controlplane has no bundle for
+// this session (returns nil; we just keep the empty workspace).
+func (m *Manager) restoreInto(sessionID string, c *Container, resumeDEKb64 string) error {
+	bundle, err := m.fetchSnapshotBundle(sessionID)
+	if err != nil {
+		return fmt.Errorf("fetch bundle: %w", err)
+	}
+	if bundle == nil {
+		// No snapshot in storage — fresh container, fine.
+		return nil
+	}
+	ct, err := decodeBase64Lenient(bundle.Ciphertext)
+	if err != nil {
+		return fmt.Errorf("decode ciphertext: %w", err)
+	}
+	dek, err := decodeBase64Lenient(resumeDEKb64)
+	if err != nil {
+		return fmt.Errorf("decode dek: %w", err)
+	}
+	plain, err := decryptSnapshotTar(dek, ct)
+	if err != nil {
+		return fmt.Errorf("decrypt tar: %w", err)
+	}
+	if err := m.pushRestore(c, plain); err != nil {
+		return fmt.Errorf("push restore: %w", err)
+	}
+	return nil
+}
+
+// decodeBase64Lenient accepts std, raw-std, url, or raw-url base64.
+// We do this because callers (webapp, controlplane) sometimes pad and
+// sometimes don't, and the snapshot wire format uses std encoding from
+// the executor while DEK headers from the webapp tend to be url-safe.
+func decodeBase64Lenient(s string) ([]byte, error) {
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if b, err := enc.DecodeString(s); err == nil {
+			return b, nil
+		}
+	}
+	return nil, fmt.Errorf("not valid base64")
 }
 
 func (m *Manager) CleanupSession(sessionID string) *Container {
@@ -386,6 +587,8 @@ func (m *Manager) CleanupSession(sessionID string) *Container {
 	if ok {
 		delete(m.sessions, sessionID)
 	}
+	delete(m.attrs, sessionID)
+	delete(m.assignLocks, sessionID)
 	m.mu.Unlock()
 	if !ok {
 		return nil
@@ -394,6 +597,84 @@ func (m *Manager) CleanupSession(sessionID string) *Container {
 	log.Printf("orchestrator: cleaning up %s for session %s", c.Name, sessionID)
 	go m.deleteContainer(c.ID)
 	return c
+}
+
+// evictAndSnapshot snapshots the container's workspace (if a pubkey was
+// cached) and PUTs the bundle to controlplane, then deletes the
+// container. Called by the idle-eviction loop. Snapshot failures still
+// destroy the container — losing state is bad, but leaving stale
+// containers around is worse and the user can always start fresh.
+func (m *Manager) evictAndSnapshot(sessionID string, c *Container) {
+	if c.Pubkey != "" {
+		bundle, err := m.fetchSnapshotFromContainer(c, c.Pubkey)
+		if err != nil {
+			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", sessionID, c.Name, err)
+		} else if err := m.putSnapshotBundle(sessionID, bundle); err != nil {
+			log.Printf("orchestrator: PUT snapshot bundle failed for session %s: %v", sessionID, err)
+		} else {
+			log.Printf("orchestrator: snapshotted session %s (container %s) to controlplane", sessionID, c.Name)
+		}
+	} else {
+		log.Printf("orchestrator: no pubkey cached for session %s — skipping snapshot", sessionID)
+	}
+	c.Status = "deleting"
+	m.deleteContainer(c.ID)
+}
+
+// StartEvictionLoop launches the background goroutine that scans
+// sessions for idleness and snapshot+evicts any whose LastActivity is
+// older than IdleTimeout. Idempotent intent: there's currently no
+// guard against starting it twice, but main.go calls it exactly once.
+func (m *Manager) StartEvictionLoop() {
+	go m.evictionLoop()
+}
+
+func (m *Manager) evictionLoop() {
+	for !m.shuttingDown {
+		time.Sleep(m.cfg.EvictionPoll)
+		if m.shuttingDown {
+			return
+		}
+		m.evictIdleSessions()
+	}
+}
+
+// evictIdleSessions snapshots each session whose LastActivity is older
+// than IdleTimeout, then destroys the container. Walks the session
+// map under the global lock to pick targets, releases the lock to do
+// the (slow) snapshot+PUT+delete dance per target.
+func (m *Manager) evictIdleSessions() {
+	type target struct {
+		sessionID string
+		c         *Container
+	}
+	now := time.Now()
+	var targets []target
+
+	m.mu.Lock()
+	for sid, c := range m.sessions {
+		if now.Sub(c.LastActivity) >= m.cfg.IdleTimeout {
+			targets = append(targets, target{sid, c})
+		}
+	}
+	for _, t := range targets {
+		delete(m.sessions, t.sessionID)
+		// Drop attrs but keep the assign lock to serialize against any
+		// in-flight GetOrAssign for the same session (so a request that
+		// arrives mid-eviction either sees the deletion and assigns a
+		// fresh container, or queues behind the evictor cleanly).
+		delete(m.attrs, t.sessionID)
+	}
+	m.mu.Unlock()
+
+	for _, t := range targets {
+		log.Printf("orchestrator: idle-evicting session %s on %s (idle ~%v)",
+			t.sessionID, t.c.Name, m.cfg.IdleTimeout)
+		m.evictAndSnapshot(t.sessionID, t.c)
+		m.mu.Lock()
+		delete(m.assignLocks, t.sessionID)
+		m.mu.Unlock()
+	}
 }
 
 func (m *Manager) CleanupAll() map[string]any {
@@ -406,6 +687,8 @@ func (m *Manager) CleanupAll() map[string]any {
 	m.warmPool = nil
 	m.inflight = nil
 	m.sessions = map[string]*Container{}
+	m.attrs = map[string]*SessionAttrs{}
+	m.assignLocks = map[string]*sync.Mutex{}
 	m.failed = nil
 	m.mu.Unlock()
 
@@ -451,6 +734,10 @@ func (m *Manager) proxy(c *Container, path string, body []byte) (int, []byte, er
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	// Record activity on every reachable proxy hop. The eviction loop
+	// uses this to compute idleness, so we want it bumped even on
+	// non-2xx responses (the user is still interacting with us).
+	c.LastActivity = time.Now()
 	return resp.StatusCode, data, nil
 }
 
