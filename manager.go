@@ -64,7 +64,8 @@ type Manager struct {
 	warmPool     []*Container
 	inflight     []*Container
 	sessions     map[string]*Container
-	assignLocks  map[string]*sync.Mutex // per-execSessionID serialization, see lockSession
+	assignLocks  map[string]*sync.Mutex      // per-execSessionID serialization, see lockSession
+	identities   map[string]*sessionIdentity // sessionID → verified Clerk user, see auth.go
 	failed       []*Container
 	failCount    int
 	apiErrors    int
@@ -84,6 +85,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		cfg:         cfg,
 		sessions:    map[string]*Container{},
 		assignLocks: map[string]*sync.Mutex{},
+		identities:  map[string]*sessionIdentity{},
 		apiClient:   &http.Client{Timeout: 30 * time.Second},
 	}
 	m.cond = sync.NewCond(&m.mu)
@@ -113,6 +115,13 @@ func (m *Manager) lockSession(sessionID string) *sync.Mutex {
 // ---------------------------------------------------------------------------
 
 func (m *Manager) apiRequest(method, path string, body any) (int, []byte, error) {
+	return m.apiRequestWithHeaders(method, path, body, nil)
+}
+
+// apiRequestWithHeaders is apiRequest plus caller-controlled headers.
+// Used for X-On-Behalf-Of on snapshot PUT/GET, where we authenticate as
+// admin but tell the controlplane which Clerk user the row belongs to.
+func (m *Manager) apiRequestWithHeaders(method, path string, body any, extra map[string]string) (int, []byte, error) {
 	var buf io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -128,6 +137,9 @@ func (m *Manager) apiRequest(method, path string, body any) (int, []byte, error)
 	req.Header.Set("Authorization", "Bearer "+m.cfg.AdminAPIKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
+	for k, v := range extra {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := m.apiClient.Do(req)
 	if err != nil {
@@ -482,8 +494,13 @@ func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected
 // using the orchestrator-passed resume DEK, and pushes plaintext into
 // the container's /restore. No-op if the controlplane has no bundle for
 // this session (returns nil; we just keep the empty workspace).
+//
+// The session is expected to already be bound to a Clerk user (the MCP
+// boundary calls AuthorizeSession before any GetOrAssign), so we look
+// up the bound user here for X-On-Behalf-Of. Empty user → no header,
+// which only happens on test paths that bypass MCP.
 func (m *Manager) restoreInto(sessionID string, c *Container, resumeDEKb64 string) error {
-	bundle, err := m.fetchSnapshotBundle(sessionID)
+	bundle, err := m.fetchSnapshotBundle(sessionID, m.SessionIdentity(sessionID))
 	if err != nil {
 		return fmt.Errorf("fetch bundle: %w", err)
 	}
@@ -534,6 +551,7 @@ func (m *Manager) CleanupSession(sessionID string) *Container {
 		delete(m.sessions, sessionID)
 	}
 	delete(m.assignLocks, sessionID)
+	delete(m.identities, sessionID)
 	m.mu.Unlock()
 	if !ok {
 		return nil
@@ -549,12 +567,18 @@ func (m *Manager) CleanupSession(sessionID string) *Container {
 // container. Called by the idle-eviction loop. Snapshot failures still
 // destroy the container — losing state is bad, but leaving stale
 // containers around is worse and the user can always start fresh.
+//
+// The PUT carries X-On-Behalf-Of: <clerk_user_id> so the controlplane
+// scopes the row to the user that owns the session. The session was
+// already bound to a Clerk user at GetOrAssign time (AuthorizeSession
+// in the MCP path); empty here only on test scenarios.
 func (m *Manager) evictAndSnapshot(sessionID string, c *Container) {
 	if c.Pubkey != "" {
+		clerkUserID := m.SessionIdentity(sessionID)
 		bundle, err := m.fetchSnapshotFromContainer(c, c.Pubkey)
 		if err != nil {
 			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", sessionID, c.Name, err)
-		} else if err := m.putSnapshotBundle(sessionID, bundle); err != nil {
+		} else if err := m.putSnapshotBundle(sessionID, clerkUserID, bundle); err != nil {
 			log.Printf("orchestrator: PUT snapshot bundle failed for session %s: %v", sessionID, err)
 		} else {
 			log.Printf("orchestrator: snapshotted session %s (container %s) to controlplane", sessionID, c.Name)
@@ -614,9 +638,12 @@ func (m *Manager) evictIdleSessions() {
 	for _, t := range targets {
 		log.Printf("orchestrator: idle-evicting session %s on %s (idle ~%v)",
 			t.sessionID, t.c.Name, m.cfg.IdleTimeout)
+		// evictAndSnapshot reads the bound identity for X-On-Behalf-Of,
+		// so we drop m.identities only after it returns.
 		m.evictAndSnapshot(t.sessionID, t.c)
 		m.mu.Lock()
 		delete(m.assignLocks, t.sessionID)
+		delete(m.identities, t.sessionID)
 		m.mu.Unlock()
 	}
 }
@@ -632,6 +659,7 @@ func (m *Manager) CleanupAll() map[string]any {
 	m.inflight = nil
 	m.sessions = map[string]*Container{}
 	m.assignLocks = map[string]*sync.Mutex{}
+	m.identities = map[string]*sessionIdentity{}
 	m.failed = nil
 	m.mu.Unlock()
 

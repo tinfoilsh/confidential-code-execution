@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 )
 
@@ -60,6 +61,24 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		if sessionID == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "X-Session-Id header is required"}
 			return http.StatusBadRequest, resp
+		}
+		// Code execution is webapp-only for v1. Verify the bearer is a
+		// Clerk JWT (via controlplane whoami), bind the session to that
+		// user on the first call, and reject any later request whose
+		// verified identity doesn't match the binding.
+		bearer := extractBearer(headers.Get("Authorization"))
+		if _, err := m.AuthorizeSession(ctx, sessionID, bearer); err != nil {
+			switch {
+			case errors.Is(err, ErrAuthRequired):
+				resp.Error = &rpcError{Code: -32001, Message: err.Error()}
+				return http.StatusUnauthorized, resp
+			case errors.Is(err, ErrIdentityMismatch):
+				resp.Error = &rpcError{Code: -32002, Message: err.Error()}
+				return http.StatusForbidden, resp
+			default:
+				resp.Error = &rpcError{Code: -32603, Message: "auth check failed: " + err.Error()}
+				return http.StatusInternalServerError, resp
+			}
 		}
 		// Stash per-request attrs on ctx. X-Exec-Pubkey is what
 		// GetOrAssign stamps onto c.Pubkey so eviction-time snapshotting

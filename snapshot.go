@@ -100,11 +100,27 @@ func decryptSnapshotTar(dek, ciphertext []byte) ([]byte, error) {
 	return plain, nil
 }
 
+// onBehalfOfHeader returns the X-On-Behalf-Of header set the
+// controlplane snapshot endpoints expect from admin-authed callers.
+// Empty when no Clerk user is bound (which shouldn't happen in
+// production: AuthorizeSession rejects non-Clerk traffic before a
+// container is assigned. Empty here means the call is from a path
+// that never went through MCP — most likely a test).
+func onBehalfOfHeader(clerkUserID string) map[string]string {
+	if clerkUserID == "" {
+		return nil
+	}
+	return map[string]string{"X-On-Behalf-Of": clerkUserID}
+}
+
 // fetchSnapshotBundle pulls the full {ciphertext, wrappedDEK} bundle for
 // the given execSessionId from controlplane. Returns (nil, nil) if no
 // bundle exists (404) so the caller can treat that as "fresh container".
-func (m *Manager) fetchSnapshotBundle(execSessionID string) (*snapshotBundle, error) {
-	status, raw, err := m.apiRequest("GET", "/api/storage/exec-snapshot/"+execSessionID, nil)
+//
+// clerkUserID is forwarded as X-On-Behalf-Of so the controlplane scopes
+// the row to the right user even though we authenticate as admin.
+func (m *Manager) fetchSnapshotBundle(execSessionID, clerkUserID string) (*snapshotBundle, error) {
+	status, raw, err := m.apiRequestWithHeaders("GET", "/api/storage/exec-snapshot/"+execSessionID, nil, onBehalfOfHeader(clerkUserID))
 	if err != nil {
 		return nil, err
 	}
@@ -121,9 +137,10 @@ func (m *Manager) fetchSnapshotBundle(execSessionID string) (*snapshotBundle, er
 	return &b, nil
 }
 
-// putSnapshotBundle uploads {ciphertext, wrappedDEK} to controlplane.
-func (m *Manager) putSnapshotBundle(execSessionID string, b *snapshotBundle) error {
-	status, raw, err := m.apiRequest("PUT", "/api/storage/exec-snapshot/"+execSessionID, b)
+// putSnapshotBundle uploads {ciphertext, wrappedDEK} to controlplane,
+// attributing the row to clerkUserID via X-On-Behalf-Of.
+func (m *Manager) putSnapshotBundle(execSessionID, clerkUserID string, b *snapshotBundle) error {
+	status, raw, err := m.apiRequestWithHeaders("PUT", "/api/storage/exec-snapshot/"+execSessionID, b, onBehalfOfHeader(clerkUserID))
 	if err != nil {
 		return err
 	}
