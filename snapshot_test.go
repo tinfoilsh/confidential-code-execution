@@ -209,9 +209,11 @@ func (rt rewritingTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 // so the manager can be exercised end-to-end without real infra.
 type fakeControlplane struct {
 	*httptest.Server
-	mu          sync.Mutex
-	getBundle   *snapshotBundle // returned for GET /api/storage/exec-snapshot/*
-	putBundles  map[string]snapshotBundle
+	mu                   sync.Mutex
+	getBundle            *snapshotBundle // returned for GET /api/storage/exec-snapshot/*
+	putBundles           map[string]snapshotBundle
+	putFailuresRemaining int // when > 0, PUT returns 500 and decrements
+	putAttempts          int // total PUT requests received (success + failure)
 }
 
 func newFakeControlplane(getBundle *snapshotBundle) *fakeControlplane {
@@ -238,6 +240,13 @@ func newFakeControlplane(getBundle *snapshotBundle) *fakeControlplane {
 				return
 			}
 			cp.mu.Lock()
+			cp.putAttempts++
+			if cp.putFailuresRemaining > 0 {
+				cp.putFailuresRemaining--
+				cp.mu.Unlock()
+				http.Error(w, "simulated transient failure", 500)
+				return
+			}
 			cp.putBundles[id] = b
 			cp.mu.Unlock()
 			w.WriteHeader(204)
@@ -333,6 +342,44 @@ func TestEvictAndSnapshot(t *testing.T) {
 	fc.mu.Unlock()
 	if gotPub != "user-pub-b64url" {
 		t.Fatalf("container /snapshot got wrong pubkey: %q", gotPub)
+	}
+}
+
+func TestEvictAndSnapshotPutRetry(t *testing.T) {
+	// First PUT attempt fails with 500; the bounded retry then succeeds and
+	// the bundle lands in storage. Verifies evictAndSnapshot retries once on
+	// transient PUT failure rather than dropping the workspace.
+	fc := newFakeContainer(snapshotBundle{
+		Ciphertext: "Y2lwaGVydGV4dA==",
+		WrappedDEK: "d3JhcHBlZA==",
+	})
+	defer fc.Close()
+	c := fakeContainer(fc)
+	c.Pubkey = "user-pub-b64url"
+
+	cp := newFakeControlplane(nil)
+	cp.putFailuresRemaining = 1
+	defer cp.Close()
+	prev := apiBase
+	apiBase = cp.URL
+	defer func() { apiBase = prev }()
+
+	prevDelay := snapshotPutRetryDelay
+	snapshotPutRetryDelay = 0
+	defer func() { snapshotPutRetryDelay = prevDelay }()
+
+	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
+	m.evictAndSnapshot("sess-retry", c)
+
+	cp.mu.Lock()
+	attempts := cp.putAttempts
+	_, stored := cp.putBundles["sess-retry"]
+	cp.mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("expected exactly 2 PUT attempts (1 fail + 1 retry), got %d", attempts)
+	}
+	if !stored {
+		t.Fatalf("bundle not stored after retry")
 	}
 }
 

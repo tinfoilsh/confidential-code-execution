@@ -20,6 +20,11 @@ import (
 // apiBase is the controlplane root for /api/* calls.
 var apiBase = "https://api.tinfoil.sh"
 
+// snapshotPutRetryDelay is how long evictAndSnapshot waits between
+// the first and second attempt to PUT a snapshot bundle to controlplane.
+// Variable so tests can shrink it.
+var snapshotPutRetryDelay = 1 * time.Second
+
 type Container struct {
 	ID         string
 	Name       string
@@ -578,10 +583,21 @@ func (m *Manager) evictAndSnapshot(sessionID string, c *Container) {
 		bundle, err := m.fetchSnapshotFromContainer(c, c.Pubkey)
 		if err != nil {
 			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", sessionID, c.Name, err)
-		} else if err := m.putSnapshotBundle(sessionID, clerkUserID, bundle); err != nil {
-			log.Printf("orchestrator: PUT snapshot bundle failed for session %s: %v", sessionID, err)
 		} else {
-			log.Printf("orchestrator: snapshotted session %s (container %s) to controlplane", sessionID, c.Name)
+			// One retry on transient PUT failure: a single controlplane blip
+			// shouldn't cost a user their workspace. Beyond that we accept the
+			// loss and the user starts fresh on next chat open.
+			putErr := m.putSnapshotBundle(sessionID, clerkUserID, bundle)
+			if putErr != nil {
+				log.Printf("orchestrator: PUT snapshot bundle failed for session %s: %v — retrying once", sessionID, putErr)
+				time.Sleep(snapshotPutRetryDelay)
+				putErr = m.putSnapshotBundle(sessionID, clerkUserID, bundle)
+			}
+			if putErr != nil {
+				log.Printf("orchestrator: PUT snapshot bundle failed for session %s after retry: %v", sessionID, putErr)
+			} else {
+				log.Printf("orchestrator: snapshotted session %s (container %s) to controlplane", sessionID, c.Name)
+			}
 		}
 	} else {
 		log.Printf("orchestrator: no pubkey cached for session %s — skipping snapshot", sessionID)
