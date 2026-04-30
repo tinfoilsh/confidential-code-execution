@@ -25,6 +25,12 @@ var apiBase = "https://api.tinfoil.sh"
 // Variable so tests can shrink it.
 var snapshotPutRetryDelay = 1 * time.Second
 
+// toolCallTimeout caps individual /exec, /read, and /write calls. The
+// container http.Client has a 90s ceiling for snapshot/restore bulk
+// transfers; this shorter budget keeps tool calls bounded so a runaway
+// bash command doesn't tie up a session for the full 90s.
+var toolCallTimeout = 35 * time.Second
+
 type Container struct {
 	ID         string
 	Name       string
@@ -91,7 +97,12 @@ func NewManager(cfg ManagerConfig) *Manager {
 		sessions:    map[string]*Container{},
 		assignLocks: map[string]*sync.Mutex{},
 		identities:  map[string]*sessionIdentity{},
-		apiClient:   &http.Client{Timeout: 30 * time.Second},
+		// 120s budget covers snapshot PUT/GET against controlplane at the
+		// /workspace tmpfs ceiling: 512 MB plaintext → ~683 MB after base64
+		// encoding into the JSON body. Container CRUD calls also share this
+		// client but finish in well under a second, so the longer cap
+		// doesn't affect them.
+		apiClient: &http.Client{Timeout: 120 * time.Second},
 	}
 	m.cond = sync.NewCond(&m.mu)
 	return m
@@ -240,16 +251,20 @@ func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
 	// enclave attestation, but the chained-attestation trust model
 	// (webapp -> router -> orchestrator -> container) requires this on
 	// in production for the resume handshake to be meaningful.
+	// 90s ceiling on the container client covers snapshot/restore bulk
+	// transfers at the /workspace tmpfs ceiling. /exec, /read, /write
+	// hold to the tighter toolCallTimeout (35s) via per-request context,
+	// so a runaway tool call can't tie up a session for the full 90s.
 	if !m.cfg.VerifyAttestation {
 		log.Printf("orchestrator: skipping attestation for %s (%s)", c.Name, c.Domain)
-		return &http.Client{Timeout: 35 * time.Second}, nil
+		return &http.Client{Timeout: 90 * time.Second}, nil
 	}
 	sc := client.NewSecureClient(c.Domain, m.cfg.ConfigRepo)
 	httpClient, err := sc.HTTPClient()
 	if err != nil {
 		return nil, err
 	}
-	httpClient.Timeout = 35 * time.Second
+	httpClient.Timeout = 90 * time.Second
 	log.Printf("orchestrator: attestation verified for %s (%s)", c.Name, c.Domain)
 	return httpClient, nil
 }
@@ -705,12 +720,14 @@ func (m *Manager) Finish() map[string]any {
 // Container proxy + high-level operations
 // ---------------------------------------------------------------------------
 
-func (m *Manager) proxy(c *Container, path string, body []byte) (int, []byte, error) {
+func (m *Manager) proxy(ctx context.Context, c *Container, path string, body []byte) (int, []byte, error) {
 	if c.httpClient == nil {
 		return 0, nil, fmt.Errorf("no http client for container %s", c.Name)
 	}
 	url := "https://" + c.Domain + path
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	callCtx, cancel := context.WithTimeout(ctx, toolCallTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -735,7 +752,7 @@ func (m *Manager) ExecCommand(ctx context.Context, sessionID, command string) ma
 		return map[string]any{"error": errMsg}
 	}
 	body, _ := json.Marshal(map[string]string{"command": command})
-	status, raw, _ := m.proxy(c, "/exec", body)
+	status, raw, _ := m.proxy(ctx, c, "/exec", body)
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status), "raw": string(raw)}
@@ -750,7 +767,7 @@ func (m *Manager) ReadFile(ctx context.Context, sessionID, path string) (string,
 		return "", fmt.Errorf("%s", errMsg)
 	}
 	body, _ := json.Marshal(map[string]string{"path": path})
-	_, raw, _ := m.proxy(c, "/read", body)
+	_, raw, _ := m.proxy(ctx, c, "/read", body)
 	var resp struct {
 		Contents string `json:"contents"`
 		Error    string `json:"error"`
@@ -776,7 +793,7 @@ func (m *Manager) WriteFile(ctx context.Context, sessionID, path, content string
 	}
 	encoded := base64.StdEncoding.EncodeToString([]byte(content))
 	body, _ := json.Marshal(map[string]string{"path": path, "contents": encoded})
-	status, raw, _ := m.proxy(c, "/write", body)
+	status, raw, _ := m.proxy(ctx, c, "/write", body)
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status)}
