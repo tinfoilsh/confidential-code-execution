@@ -177,33 +177,37 @@ func (m *Manager) putSnapshotTar(ctx context.Context, accessToken, codeExecution
 // The api-server token gate also gets its first claim from this call when
 // there's a snapshot to restore; on a 403 the recordContainerStatus path
 // counts toward the consecutive-403s threshold like any other call.
-func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []byte) error {
+//
+// Returns (status, err). status is 0 when the request never produced an
+// HTTP response (transport-level failure). The caller uses status to
+// decide whether a retry is worth attempting — 4xx isn't, 5xx and 0 are.
+func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []byte) (int, error) {
 	if c.httpClient == nil {
-		return fmt.Errorf("no http client for container %s", c.Name)
+		return 0, fmt.Errorf("no http client for container %s", c.Name)
 	}
 	body, err := json.Marshal(map[string]string{
 		"tar": base64.StdEncoding.EncodeToString(plaintextTar),
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req, err := http.NewRequest("POST", "https://"+c.Domain+"/restore", bytes.NewReader(body))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("restore POST: %w", err)
+		return 0, fmt.Errorf("restore POST: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("restore returned %d: %s", resp.StatusCode, string(data))
+		return resp.StatusCode, fmt.Errorf("restore returned %d: %s", resp.StatusCode, string(data))
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 // fetchSnapshotFromContainer asks the running container for a plaintext

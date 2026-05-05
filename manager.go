@@ -25,6 +25,13 @@ var apiBase = "https://api.tinfoil.sh"
 // Variable so tests can shrink it.
 var snapshotPutRetryDelay = 1 * time.Second
 
+// restorePushRetryDelay is the pause between the first and second
+// pushRestore attempt when the first sees a transient failure. The
+// executor's api-server keeps the restore window open across multiple
+// /restore calls (the token gate also tolerates same-token retries), so
+// a single retry is safe to layer on top. Variable so tests can shrink it.
+var restorePushRetryDelay = 1 * time.Second
+
 // toolCallTimeout caps individual /exec, /read, and /write calls. The
 // container http.Client has a 90s ceiling for snapshot/restore bulk
 // transfers; this shorter budget keeps tool calls bounded so a runaway
@@ -531,7 +538,18 @@ func (m *Manager) restoreInto(ctx context.Context, accessToken string, c *Contai
 		// No snapshot (or unreadable with this key) — fresh container, fine.
 		return nil
 	}
-	if err := m.pushRestore(c, accessToken, tarBytes); err != nil {
+	// Bounded retry on transient failure (network blip, executor 5xx,
+	// 502 from api-server). 4xx (incl. 403 token mismatch, 410 window
+	// closed) won't recover — bail immediately and let the consecutive-
+	// 403s counter handle the poisoned-container case via the user's
+	// next call.
+	status, err := m.pushRestore(c, accessToken, tarBytes)
+	if err != nil && (status == 0 || status >= 500) {
+		log.Printf("orchestrator: pushRestore transient failure for session %s: %v — retrying once", accessToken, err)
+		time.Sleep(restorePushRetryDelay)
+		_, err = m.pushRestore(c, accessToken, tarBytes)
+	}
+	if err != nil {
 		return fmt.Errorf("push restore: %w", err)
 	}
 	return nil
