@@ -32,28 +32,29 @@ import (
 // bucketsBase is the tinfoil-buckets root. Override via env in main.go.
 var bucketsBase = "https://buckets.tinfoil.sh"
 
-// ctxKeyExecKey carries the user's symmetric exec key down the call
-// chain. The MCP boundary reads X-Exec-Key from the request and stashes
-// it here; GetOrAssign and the eviction path read it back. Lifetime is
-// bounded by the request goroutine — when the handler returns, the
-// context is gone, so a stale key can't leak into a later request.
+// ctxKeyCodeExecutionEncryptionKey carries the user's symmetric Code
+// Execution Encryption Key down the call chain. The MCP boundary reads
+// X-Code-Execution-Encryption-Key from the request and stashes it here;
+// GetOrAssign and the eviction path read it back. Lifetime is bounded by
+// the request goroutine — when the handler returns, the context is gone,
+// so a stale key can't leak into a later request.
 type ctxKey int
 
 const (
-	ctxKeyExecKey ctxKey = iota
+	ctxKeyCodeExecutionEncryptionKey ctxKey = iota
 )
 
-// WithSessionAttrs returns a child context carrying the user's exec key.
-// Empty values are not stored.
-func WithSessionAttrs(ctx context.Context, execKey string) context.Context {
-	if execKey != "" {
-		ctx = context.WithValue(ctx, ctxKeyExecKey, execKey)
+// WithCodeExecutionEncryptionKey returns a child context carrying the
+// user's Code Execution Encryption Key. Empty values are not stored.
+func WithCodeExecutionEncryptionKey(ctx context.Context, key string) context.Context {
+	if key != "" {
+		ctx = context.WithValue(ctx, ctxKeyCodeExecutionEncryptionKey, key)
 	}
 	return ctx
 }
 
-func sessionExecKey(ctx context.Context) string {
-	v, _ := ctx.Value(ctxKeyExecKey).(string)
+func sessionCodeExecutionEncryptionKey(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyCodeExecutionEncryptionKey).(string)
 	return v
 }
 
@@ -90,10 +91,10 @@ func toStdBase64(s string) (string, error) {
 // (404), or when the supplied key can't open the entry (403 — wrong
 // key or corrupt envelope). Both cases are non-fatal: GetOrAssign
 // proceeds with a fresh empty workspace.
-func (m *Manager) fetchSnapshotTar(ctx context.Context, sessionID, execKeyB64 string) ([]byte, error) {
-	keyStd, err := toStdBase64(execKeyB64)
+func (m *Manager) fetchSnapshotTar(ctx context.Context, sessionID, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
+	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
 	if err != nil {
-		return nil, fmt.Errorf("decode exec key: %w", err)
+		return nil, fmt.Errorf("decode code execution encryption key: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", bucketsBase+"/items/"+sessionID, nil)
 	if err != nil {
@@ -133,13 +134,13 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, sessionID, execKeyB64 st
 	return tarBytes, nil
 }
 
-// putSnapshotTar PUTs the plaintext tar to buckets, encrypting under
-// execKeyB64. Buckets generates a fresh DEK per PUT (envelope v1) and
-// wraps it under the supplied key.
-func (m *Manager) putSnapshotTar(ctx context.Context, sessionID, execKeyB64 string, tarBytes []byte) error {
-	keyStd, err := toStdBase64(execKeyB64)
+// putSnapshotTar PUTs the plaintext tar to buckets, encrypting under the
+// supplied Code Execution Encryption Key. Buckets generates a fresh DEK
+// per PUT (envelope v1) and wraps it under the supplied key.
+func (m *Manager) putSnapshotTar(ctx context.Context, sessionID, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
+	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
 	if err != nil {
-		return fmt.Errorf("decode exec key: %w", err)
+		return fmt.Errorf("decode code execution encryption key: %w", err)
 	}
 	body, err := json.Marshal(map[string]any{
 		"value":           base64.StdEncoding.EncodeToString(tarBytes),

@@ -244,7 +244,7 @@ func TestRestoreOnAssign(t *testing.T) {
 	m.warmPool = []*Container{c}
 
 	// Webapp sends url-safe base64; orchestrator should normalize.
-	ctx := WithSessionAttrs(context.Background(), keyURL)
+	ctx := WithCodeExecutionEncryptionKey(context.Background(), keyURL)
 
 	got, errMsg := m.GetOrAssign(ctx, "sess-1", nil)
 	if got == nil {
@@ -257,8 +257,8 @@ func TestRestoreOnAssign(t *testing.T) {
 	if !bytes.Equal(gotTar, plainTar) {
 		t.Fatalf("restore did not deliver plaintext tar to container.\nwant %q\n got %q", plainTar, gotTar)
 	}
-	if got.ExecKey != keyURL {
-		t.Fatalf("exec key not cached on container: %q", got.ExecKey)
+	if got.CodeExecutionEncryptionKey != keyURL {
+		t.Fatalf("code execution encryption key not cached on container: %q", got.CodeExecutionEncryptionKey)
 	}
 }
 
@@ -278,7 +278,7 @@ func TestRestoreOnAssignNoSnapshot(t *testing.T) {
 	m.warmPool = []*Container{c}
 
 	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
-	ctx := WithSessionAttrs(context.Background(), keyURL)
+	ctx := WithCodeExecutionEncryptionKey(context.Background(), keyURL)
 
 	if got, errMsg := m.GetOrAssign(ctx, "sess-fresh", nil); got == nil {
 		t.Fatalf("GetOrAssign failed: %s", errMsg)
@@ -300,7 +300,7 @@ func TestEvictAndSnapshot(t *testing.T) {
 
 	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
 	keyStd, _ := toStdBase64(keyURL)
-	c.ExecKey = keyURL
+	c.CodeExecutionEncryptionKey = keyURL
 
 	bk := newFakeBuckets()
 	defer bk.Close()
@@ -330,7 +330,7 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	fc := newFakeContainer([]byte("tar-bytes"))
 	defer fc.Close()
 	c := fakeContainer(fc)
-	c.ExecKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x22}, 32))
+	c.CodeExecutionEncryptionKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x22}, 32))
 
 	bk := newFakeBuckets()
 	bk.putFailuresRemaining = 1

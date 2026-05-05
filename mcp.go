@@ -29,9 +29,10 @@ type rpcError struct {
 // Returns (status, response). If response is nil, the request was a notification.
 //
 // ctx is the per-request context — pass r.Context() from the HTTP handler.
-// The user's symmetric exec key is stamped onto a child context via
-// WithSessionAttrs and read back at the GetOrAssign call site, so it
-// lives exactly as long as the request goroutine.
+// The user's symmetric Code Execution Encryption Key is stamped onto a
+// child context via WithCodeExecutionEncryptionKey and read back at the
+// GetOrAssign call site, so it lives exactly as long as the request
+// goroutine.
 func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req jsonRPCRequest) (int, *jsonRPCResponse) {
 	// Notifications have no id
 	if req.ID == nil {
@@ -57,9 +58,9 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		return http.StatusOK, resp
 
 	case "tools/call":
-		sessionID := headers.Get("X-Session-Id")
+		sessionID := headers.Get("X-Code-Execution-Access-Token")
 		if sessionID == "" {
-			resp.Error = &rpcError{Code: -32602, Message: "X-Session-Id header is required"}
+			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token header is required"}
 			return http.StatusBadRequest, resp
 		}
 		// Code execution is webapp-only for v1. Verify the bearer is a
@@ -73,11 +74,12 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32603, Message: "auth check failed: " + err.Error()}
 			return http.StatusInternalServerError, resp
 		}
-		// Stash the exec key on ctx. GetOrAssign reads it back to (a) cache
-		// it on c.ExecKey for eviction-time encryption via buckets, and
-		// (b) drive the restore-on-assign fetch from buckets before the
-		// fresh container is exposed to traffic.
-		ctx = WithSessionAttrs(ctx, headers.Get("X-Exec-Key"))
+		// Stash the Code Execution Encryption Key on ctx. GetOrAssign reads
+		// it back to (a) cache it on c.CodeExecutionEncryptionKey for
+		// eviction-time encryption via buckets, and (b) drive the
+		// restore-on-assign fetch from buckets before the fresh container
+		// is exposed to traffic.
+		ctx = WithCodeExecutionEncryptionKey(ctx, headers.Get("X-Code-Execution-Encryption-Key"))
 		name, _ := req.Params["name"].(string)
 		args, _ := req.Params["arguments"].(map[string]any)
 		handler, ok := ToolHandlers[name]

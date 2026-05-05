@@ -36,11 +36,11 @@ go build -o orchestrator .
 
 ### API
 
-All tool access is through the single MCP endpoint. The session ID comes from the `X-Session-Id` header.
+All tool access is through the single MCP endpoint. The session ID comes from the `X-Code-Execution-Access-Token` header.
 
 ```
 POST /mcp
-Headers: X-Session-Id: <id>
+Headers: X-Code-Execution-Access-Token: <token>
 Body: JSON-RPC 2.0
 
 Methods:

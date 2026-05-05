@@ -40,7 +40,7 @@ def _mcp_request(method: str, params: dict | None = None, session_id: str = "") 
 
     headers = {"Content-Type": "application/json"}
     if session_id:
-        headers["X-Session-Id"] = session_id
+        headers["X-Code-Execution-Access-Token"] = session_id
 
     req = urllib.request.Request(
         MCP_URL,
