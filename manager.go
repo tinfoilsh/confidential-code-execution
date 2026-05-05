@@ -117,14 +117,14 @@ func NewManager(cfg ManagerConfig) *Manager {
 // wins; the second sees the in-memory hit and re-uses the assigned
 // container. Locks are kept indefinitely (one per session, cheap) until
 // CleanupSession drops them.
-func (m *Manager) lockSession(sessionID string) *sync.Mutex {
+func (m *Manager) lockSession(accessToken string) *sync.Mutex {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if l, ok := m.assignLocks[sessionID]; ok {
+	if l, ok := m.assignLocks[accessToken]; ok {
 		return l
 	}
 	l := &sync.Mutex{}
-	m.assignLocks[sessionID] = l
+	m.assignLocks[accessToken] = l
 	return l
 }
 
@@ -436,16 +436,16 @@ func (m *Manager) poolManagerLoop() {
 // present at assign time we also try to restore from buckets — buckets
 // returns 404 if no snapshot exists yet, in which case we proceed with
 // an empty workspace.
-func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected func() bool) (*Container, string) {
+func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnected func() bool) (*Container, string) {
 	// Take the per-session lock first. This is the serialization point.
-	sl := m.lockSession(sessionID)
+	sl := m.lockSession(accessToken)
 	sl.Lock()
 	defer sl.Unlock()
 
 	codeExecutionEncryptionKey := sessionCodeExecutionEncryptionKey(ctx)
 
 	m.mu.Lock()
-	if c, ok := m.sessions[sessionID]; ok {
+	if c, ok := m.sessions[accessToken]; ok {
 		if codeExecutionEncryptionKey != "" {
 			c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
 		}
@@ -465,7 +465,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected
 		}
 		if isConnected != nil && !isConnected() {
 			m.mu.Unlock()
-			log.Printf("orchestrator: client disconnected while waiting for session %s", sessionID)
+			log.Printf("orchestrator: client disconnected while waiting for session %s", accessToken)
 			return nil, "client disconnected"
 		}
 		// wait up to 2s at a time so we can re-check connection / deadline
@@ -490,11 +490,11 @@ func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected
 	// workspace — better than refusing to assign and breaking the user's
 	// chat entirely.
 	if codeExecutionEncryptionKey != "" {
-		if err := m.restoreInto(ctx, sessionID, c, codeExecutionEncryptionKey); err != nil {
+		if err := m.restoreInto(ctx, accessToken, c, codeExecutionEncryptionKey); err != nil {
 			log.Printf("orchestrator: restore failed for session %s on %s: %v (continuing with empty workspace)",
-				sessionID, c.Name, err)
+				accessToken, c.Name, err)
 		} else {
-			log.Printf("orchestrator: restore complete for session %s on %s", sessionID, c.Name)
+			log.Printf("orchestrator: restore complete for session %s on %s", accessToken, c.Name)
 		}
 	}
 
@@ -502,20 +502,20 @@ func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected
 	// on a half-bootstrapped container.
 	m.mu.Lock()
 	c.Status = "assigned"
-	m.sessions[sessionID] = c
+	m.sessions[accessToken] = c
 	m.mu.Unlock()
 
-	log.Printf("orchestrator: assigned %s to session %s", c.Name, sessionID)
+	log.Printf("orchestrator: assigned %s to session %s", c.Name, accessToken)
 	return c, ""
 }
 
-// restoreInto fetches the snapshot for sessionID from buckets (which
+// restoreInto fetches the snapshot for accessToken from buckets (which
 // decrypts under the supplied Code Execution Encryption Key) and pushes
 // the plaintext tar into the container's /restore. No-op when the
 // bucket has no entry, or when the supplied key can't open the entry —
 // both surface as a fresh empty workspace.
-func (m *Manager) restoreInto(ctx context.Context, sessionID string, c *Container, codeExecutionEncryptionKeyB64 string) error {
-	tarBytes, err := m.fetchSnapshotTar(ctx, sessionID, codeExecutionEncryptionKeyB64)
+func (m *Manager) restoreInto(ctx context.Context, accessToken string, c *Container, codeExecutionEncryptionKeyB64 string) error {
+	tarBytes, err := m.fetchSnapshotTar(ctx, accessToken, codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return fmt.Errorf("fetch snapshot: %w", err)
 	}
@@ -529,19 +529,19 @@ func (m *Manager) restoreInto(ctx context.Context, sessionID string, c *Containe
 	return nil
 }
 
-func (m *Manager) CleanupSession(sessionID string) *Container {
+func (m *Manager) CleanupSession(accessToken string) *Container {
 	m.mu.Lock()
-	c, ok := m.sessions[sessionID]
+	c, ok := m.sessions[accessToken]
 	if ok {
-		delete(m.sessions, sessionID)
+		delete(m.sessions, accessToken)
 	}
-	delete(m.assignLocks, sessionID)
+	delete(m.assignLocks, accessToken)
 	m.mu.Unlock()
 	if !ok {
 		return nil
 	}
 	c.Status = "deleting"
-	log.Printf("orchestrator: cleaning up %s for session %s", c.Name, sessionID)
+	log.Printf("orchestrator: cleaning up %s for session %s", c.Name, accessToken)
 	go m.deleteContainer(c.ID)
 	return c
 }
@@ -552,30 +552,30 @@ func (m *Manager) CleanupSession(sessionID string) *Container {
 // container. Called by the idle-eviction loop. Snapshot failures still
 // destroy the container — losing state is bad, but leaving stale
 // containers around is worse and the user can always start fresh.
-func (m *Manager) evictAndSnapshot(sessionID string, c *Container) {
+func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 	if c.CodeExecutionEncryptionKey != "" {
 		ctx := context.Background()
 		tarBytes, err := m.fetchSnapshotFromContainer(c)
 		if err != nil {
-			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", sessionID, c.Name, err)
+			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", accessToken, c.Name, err)
 		} else {
 			// One retry on transient PUT failure: a single buckets blip
 			// shouldn't cost a user their workspace. Beyond that we accept
 			// the loss and the user starts fresh on next chat open.
-			putErr := m.putSnapshotTar(ctx, sessionID, c.CodeExecutionEncryptionKey, tarBytes)
+			putErr := m.putSnapshotTar(ctx, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			if putErr != nil {
-				log.Printf("orchestrator: PUT snapshot failed for session %s: %v — retrying once", sessionID, putErr)
+				log.Printf("orchestrator: PUT snapshot failed for session %s: %v — retrying once", accessToken, putErr)
 				time.Sleep(snapshotPutRetryDelay)
-				putErr = m.putSnapshotTar(ctx, sessionID, c.CodeExecutionEncryptionKey, tarBytes)
+				putErr = m.putSnapshotTar(ctx, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			}
 			if putErr != nil {
-				log.Printf("orchestrator: PUT snapshot failed for session %s after retry: %v", sessionID, putErr)
+				log.Printf("orchestrator: PUT snapshot failed for session %s after retry: %v", accessToken, putErr)
 			} else {
-				log.Printf("orchestrator: snapshotted session %s (container %s) to buckets", sessionID, c.Name)
+				log.Printf("orchestrator: snapshotted session %s (container %s) to buckets", accessToken, c.Name)
 			}
 		}
 	} else {
-		log.Printf("orchestrator: no code execution encryption key cached for session %s — skipping snapshot", sessionID)
+		log.Printf("orchestrator: no code execution encryption key cached for session %s — skipping snapshot", accessToken)
 	}
 	c.Status = "deleting"
 	m.deleteContainer(c.ID)
@@ -605,7 +605,7 @@ func (m *Manager) evictionLoop() {
 // the (slow) snapshot+PUT+delete dance per target.
 func (m *Manager) evictIdleSessions() {
 	type target struct {
-		sessionID string
+		accessToken string
 		c         *Container
 	}
 	now := time.Now()
@@ -622,16 +622,16 @@ func (m *Manager) evictIdleSessions() {
 		// against any in-flight GetOrAssign for the same session: a
 		// request arriving mid-eviction either sees the deletion and
 		// assigns a fresh container, or queues behind the evictor cleanly.
-		delete(m.sessions, t.sessionID)
+		delete(m.sessions, t.accessToken)
 	}
 	m.mu.Unlock()
 
 	for _, t := range targets {
 		log.Printf("orchestrator: idle-evicting session %s on %s (idle ~%v)",
-			t.sessionID, t.c.Name, m.cfg.IdleTimeout)
-		m.evictAndSnapshot(t.sessionID, t.c)
+			t.accessToken, t.c.Name, m.cfg.IdleTimeout)
+		m.evictAndSnapshot(t.accessToken, t.c)
 		m.mu.Lock()
-		delete(m.assignLocks, t.sessionID)
+		delete(m.assignLocks, t.accessToken)
 		m.mu.Unlock()
 	}
 }
@@ -702,8 +702,8 @@ func (m *Manager) proxy(ctx context.Context, c *Container, path string, body []b
 }
 
 // ExecCommand runs a bash command in the session's container.
-func (m *Manager) ExecCommand(ctx context.Context, sessionID, command string) map[string]any {
-	c, errMsg := m.GetOrAssign(ctx, sessionID, nil)
+func (m *Manager) ExecCommand(ctx context.Context, accessToken, command string) map[string]any {
+	c, errMsg := m.GetOrAssign(ctx, accessToken, nil)
 	if c == nil {
 		return map[string]any{"error": errMsg}
 	}
@@ -717,8 +717,8 @@ func (m *Manager) ExecCommand(ctx context.Context, sessionID, command string) ma
 }
 
 // ReadFile reads a text file from the session's container.
-func (m *Manager) ReadFile(ctx context.Context, sessionID, path string) (string, error) {
-	c, errMsg := m.GetOrAssign(ctx, sessionID, nil)
+func (m *Manager) ReadFile(ctx context.Context, accessToken, path string) (string, error) {
+	c, errMsg := m.GetOrAssign(ctx, accessToken, nil)
 	if c == nil {
 		return "", fmt.Errorf("%s", errMsg)
 	}
@@ -742,8 +742,8 @@ func (m *Manager) ReadFile(ctx context.Context, sessionID, path string) (string,
 }
 
 // WriteFile writes text content to a file on the session's container.
-func (m *Manager) WriteFile(ctx context.Context, sessionID, path, content string) map[string]any {
-	c, errMsg := m.GetOrAssign(ctx, sessionID, nil)
+func (m *Manager) WriteFile(ctx context.Context, accessToken, path, content string) map[string]any {
+	c, errMsg := m.GetOrAssign(ctx, accessToken, nil)
 	if c == nil {
 		return map[string]any{"error": errMsg}
 	}
@@ -758,8 +758,8 @@ func (m *Manager) WriteFile(ctx context.Context, sessionID, path, content string
 }
 
 // FileExists returns true iff the file is readable.
-func (m *Manager) FileExists(ctx context.Context, sessionID, path string) bool {
-	_, err := m.ReadFile(ctx, sessionID, path)
+func (m *Manager) FileExists(ctx context.Context, accessToken, path string) bool {
+	_, err := m.ReadFile(ctx, accessToken, path)
 	return err == nil
 }
 
@@ -785,7 +785,7 @@ func (m *Manager) MetricsInfo() map[string]any {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	rec := func(c *Container, sessionID string) map[string]any {
+	rec := func(c *Container, accessToken string) map[string]any {
 		d := map[string]any{
 			"id":       c.ID,
 			"name":     c.Name,
@@ -793,8 +793,8 @@ func (m *Manager) MetricsInfo() map[string]any {
 			"uptime":   int(now.Sub(c.CreatedAt).Seconds()),
 			"ssh_port": c.SSHPort,
 		}
-		if sessionID != "" {
-			d["session_id"] = sessionID
+		if accessToken != "" {
+			d["code_execution_access_token"] = accessToken
 			active := 0
 			if !c.AssignedAt.IsZero() {
 				active = int(now.Sub(c.AssignedAt).Seconds())

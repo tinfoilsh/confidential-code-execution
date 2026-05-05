@@ -36,7 +36,7 @@ go build -o orchestrator .
 
 ### API
 
-All tool access is through the single MCP endpoint. The session ID comes from the `X-Code-Execution-Access-Token` header.
+All tool access is through the single MCP endpoint. The session is identified by the per-chat secret in the `X-Code-Execution-Access-Token` header.
 
 ```
 POST /mcp
@@ -56,7 +56,7 @@ Admin endpoints:
 ```
 GET  /health        — pool counts
 GET  /metrics       — full container details (used by viz.py)
-POST /cleanup       {"sessionId": "abc"}  — release a single session
+POST /cleanup       {"codeExecutionAccessToken": "abc"}  — release a single session
 POST /delete-all    — delete all tracked containers (with name verification)
 POST /finish        — delete all containers and shut down the server
 ```

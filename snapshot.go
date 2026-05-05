@@ -9,12 +9,12 @@ package main
 //
 // Flow:
 //
-//   1. on resume: GET /items/{sessionID} from buckets with the user's
+//   1. on resume: GET /items/{accessToken} from buckets with the user's
 //      X-Encryption-Key, get plaintext tar back, push it into the fresh
 //      container's /restore endpoint before exposing it.
 //   2. on eviction: ask the container for a plaintext tar (its /snapshot
 //      now returns plaintext — encryption is upstream), PUT it to
-//      /items/{sessionID} with the cached exec key, then destroy the
+//      /items/{accessToken} with the cached exec key, then destroy the
 //      container.
 //
 // The container never sees the key; the orchestrator never sees ciphertext.
@@ -86,17 +86,17 @@ func toStdBase64(s string) (string, error) {
 	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
-// fetchSnapshotTar pulls the plaintext tar for sessionID from buckets.
-// Returns (nil, nil) when the bucket has no entry for this sessionID
+// fetchSnapshotTar pulls the plaintext tar for accessToken from buckets.
+// Returns (nil, nil) when the bucket has no entry for this accessToken
 // (404), or when the supplied key can't open the entry (403 — wrong
 // key or corrupt envelope). Both cases are non-fatal: GetOrAssign
 // proceeds with a fresh empty workspace.
-func (m *Manager) fetchSnapshotTar(ctx context.Context, sessionID, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
+func (m *Manager) fetchSnapshotTar(ctx context.Context, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
 	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return nil, fmt.Errorf("decode code execution encryption key: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", bucketsBase+"/items/"+sessionID, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", bucketsBase+"/items/"+accessToken, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +118,7 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, sessionID, codeExecution
 		return nil, nil
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("buckets GET %s: %d %s", sessionID, resp.StatusCode, string(raw))
+		return nil, fmt.Errorf("buckets GET %s: %d %s", accessToken, resp.StatusCode, string(raw))
 	}
 
 	var body struct {
@@ -137,7 +137,7 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, sessionID, codeExecution
 // putSnapshotTar PUTs the plaintext tar to buckets, encrypting under the
 // supplied Code Execution Encryption Key. Buckets generates a fresh DEK
 // per PUT (envelope v1) and wraps it under the supplied key.
-func (m *Manager) putSnapshotTar(ctx context.Context, sessionID, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
+func (m *Manager) putSnapshotTar(ctx context.Context, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
 	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return fmt.Errorf("decode code execution encryption key: %w", err)
@@ -149,7 +149,7 @@ func (m *Manager) putSnapshotTar(ctx context.Context, sessionID, codeExecutionEn
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "PUT", bucketsBase+"/items/"+sessionID, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "PUT", bucketsBase+"/items/"+accessToken, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -163,7 +163,7 @@ func (m *Manager) putSnapshotTar(ctx context.Context, sessionID, codeExecutionEn
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("buckets PUT %s: %d %s", sessionID, resp.StatusCode, string(raw))
+		return fmt.Errorf("buckets PUT %s: %d %s", accessToken, resp.StatusCode, string(raw))
 	}
 	return nil
 }

@@ -58,8 +58,8 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		return http.StatusOK, resp
 
 	case "tools/call":
-		sessionID := headers.Get("X-Code-Execution-Access-Token")
-		if sessionID == "" {
+		accessToken := headers.Get("X-Code-Execution-Access-Token")
+		if accessToken == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token header is required"}
 			return http.StatusBadRequest, resp
 		}
@@ -87,7 +87,7 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32601, Message: "unknown tool: " + name}
 			return http.StatusBadRequest, resp
 		}
-		text, err := handler(ctx, m, sessionID, args)
+		text, err := handler(ctx, m, accessToken, args)
 		if err != nil {
 			resp.Result = map[string]any{
 				"content": []map[string]any{{"type": "text", "text": "Error: " + err.Error()}},

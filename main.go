@@ -92,16 +92,16 @@ func main() {
 	})
 	mux.HandleFunc("/cleanup", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			SessionID string `json:"sessionId"`
+			AccessToken string `json:"codeExecutionAccessToken"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		if body.SessionID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sessionId is required"})
+		if body.AccessToken == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "codeExecutionAccessToken is required"})
 			return
 		}
-		c := mgr.CleanupSession(body.SessionID)
+		c := mgr.CleanupSession(body.AccessToken)
 		if c == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no session found for " + body.SessionID})
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no session found for " + body.AccessToken})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "cleaned up", "container": c.Name})
