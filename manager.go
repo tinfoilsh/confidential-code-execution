@@ -78,8 +78,7 @@ type Manager struct {
 	warmPool     []*Container
 	inflight     []*Container
 	sessions     map[string]*Container
-	assignLocks  map[string]*sync.Mutex      // per-execSessionID serialization, see lockSession
-	identities   map[string]*sessionIdentity // sessionID → verified Clerk user, see auth.go
+	assignLocks  map[string]*sync.Mutex // per-execSessionID serialization, see lockSession
 	failed       []*Container
 	failCount    int
 	apiErrors    int
@@ -99,7 +98,6 @@ func NewManager(cfg ManagerConfig) *Manager {
 		cfg:         cfg,
 		sessions:    map[string]*Container{},
 		assignLocks: map[string]*sync.Mutex{},
-		identities:  map[string]*sessionIdentity{},
 		// 120s budget covers snapshot PUT/GET against controlplane at the
 		// /workspace tmpfs ceiling: 512 MB plaintext → ~683 MB after base64
 		// encoding into the JSON body. Container CRUD calls also share this
@@ -535,7 +533,6 @@ func (m *Manager) CleanupSession(sessionID string) *Container {
 		delete(m.sessions, sessionID)
 	}
 	delete(m.assignLocks, sessionID)
-	delete(m.identities, sessionID)
 	m.mu.Unlock()
 	if !ok {
 		return nil
@@ -632,7 +629,6 @@ func (m *Manager) evictIdleSessions() {
 		m.evictAndSnapshot(t.sessionID, t.c)
 		m.mu.Lock()
 		delete(m.assignLocks, t.sessionID)
-		delete(m.identities, t.sessionID)
 		m.mu.Unlock()
 	}
 }
@@ -648,7 +644,6 @@ func (m *Manager) CleanupAll() map[string]any {
 	m.inflight = nil
 	m.sessions = map[string]*Container{}
 	m.assignLocks = map[string]*sync.Mutex{}
-	m.identities = map[string]*sessionIdentity{}
 	m.failed = nil
 	m.mu.Unlock()
 

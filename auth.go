@@ -1,17 +1,13 @@
 package main
 
-// Code execution is webapp-only for v1: every session must bind to a
-// verified Clerk user. The orchestrator delegates JWT verification to
-// the controlplane's /api/auth/whoami endpoint to avoid embedding the
-// Clerk SDK across services. Once verified, the (sessionID → user)
-// binding lives on Manager.identities; subsequent calls with a
-// different verified identity are rejected. The binding has no role
-// in storage — buckets is keyed only by sessionID + the user's
-// symmetric key, with no per-user attribution column.
+// Code execution is webapp-only for v1: every tools/call must carry a
+// real Clerk JWT (we don't check who it is, just that it exists).
+// The orchestrator delegates JWT verification to the
+// controlplane's /api/auth/whoami endpoint to avoid embedding the
+// Clerk SDK across services.
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,65 +15,24 @@ import (
 	"strings"
 )
 
-// sessionIdentity records the Clerk user a session is bound to, plus a
-// hash of the bearer last verified for it. We only re-call whoami when
-// the hash changes (token refresh) or on the first call in a session,
-// so steady-state per-tool-call cost is a map lookup, not a network
-// hop.
-type sessionIdentity struct {
-	clerkUserID string
-	bearerHash  [32]byte
-}
-
-// ErrAuthRequired is returned when the request lacks a Clerk JWT.
-// Bare API keys can't open a code-execution session in v1.
+// ErrAuthRequired is returned when the request lacks a valid Clerk JWT.
 var ErrAuthRequired = errors.New("code execution requires a Clerk-authenticated session")
 
-// ErrIdentityMismatch is returned when a request to an existing
-// session arrives with a different verified user than the one that
-// originally bound it. Catches the cross-user proxy attack.
-var ErrIdentityMismatch = errors.New("session is bound to a different user")
-
-// AuthorizeSession verifies the request's bearer via controlplane
-// whoami, binds the session on first call, and rejects mismatched
-// identity on subsequent calls. Returns the bound Clerk user ID.
-func (m *Manager) AuthorizeSession(ctx context.Context, sessionID, bearer string) (string, error) {
+// AuthorizeSession verifies the request's bearer is a real Clerk JWT
+// via controlplane whoami. No caching, no binding — just a single
+// round trip per tool call.
+func (m *Manager) AuthorizeSession(ctx context.Context, bearer string) error {
 	if bearer == "" {
-		return "", ErrAuthRequired
+		return ErrAuthRequired
 	}
-	hash := sha256.Sum256([]byte(bearer))
-
-	m.mu.Lock()
-	bound, ok := m.identities[sessionID]
-	m.mu.Unlock()
-	if ok && bound.bearerHash == hash {
-		return bound.clerkUserID, nil
-	}
-
 	userID, err := m.whoami(ctx, bearer)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if userID == "" {
-		return "", ErrAuthRequired
+		return ErrAuthRequired
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if bound, ok := m.identities[sessionID]; ok {
-		if bound.clerkUserID != userID {
-			return "", ErrIdentityMismatch
-		}
-		// Same user, fresh token: refresh the hash so the next call
-		// short-circuits without another whoami round-trip.
-		bound.bearerHash = hash
-		return userID, nil
-	}
-	m.identities[sessionID] = &sessionIdentity{
-		clerkUserID: userID,
-		bearerHash:  hash,
-	}
-	return userID, nil
+	return nil
 }
 
 // whoami asks controlplane to resolve the user behind a bearer.

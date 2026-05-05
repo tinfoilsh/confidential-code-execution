@@ -14,9 +14,9 @@ type jsonRPCRequest struct {
 }
 
 type jsonRPCResponse struct {
-	JSONRPC string `json:"jsonrpc"`
-	ID      any    `json:"id,omitempty"`
-	Result  any    `json:"result,omitempty"`
+	JSONRPC string    `json:"jsonrpc"`
+	ID      any       `json:"id,omitempty"`
+	Result  any       `json:"result,omitempty"`
 	Error   *rpcError `json:"error,omitempty"`
 }
 
@@ -63,22 +63,15 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			return http.StatusBadRequest, resp
 		}
 		// Code execution is webapp-only for v1. Verify the bearer is a
-		// Clerk JWT (via controlplane whoami), bind the session to that
-		// user on the first call, and reject any later request whose
-		// verified identity doesn't match the binding.
+		// real Clerk JWT via controlplane whoami.
 		bearer := extractBearer(headers.Get("Authorization"))
-		if _, err := m.AuthorizeSession(ctx, sessionID, bearer); err != nil {
-			switch {
-			case errors.Is(err, ErrAuthRequired):
+		if err := m.AuthorizeSession(ctx, bearer); err != nil {
+			if errors.Is(err, ErrAuthRequired) {
 				resp.Error = &rpcError{Code: -32001, Message: err.Error()}
 				return http.StatusUnauthorized, resp
-			case errors.Is(err, ErrIdentityMismatch):
-				resp.Error = &rpcError{Code: -32002, Message: err.Error()}
-				return http.StatusForbidden, resp
-			default:
-				resp.Error = &rpcError{Code: -32603, Message: "auth check failed: " + err.Error()}
-				return http.StatusInternalServerError, resp
 			}
+			resp.Error = &rpcError{Code: -32603, Message: "auth check failed: " + err.Error()}
+			return http.StatusInternalServerError, resp
 		}
 		// Stash the exec key on ctx. GetOrAssign reads it back to (a) cache
 		// it on c.ExecKey for eviction-time encryption via buckets, and
