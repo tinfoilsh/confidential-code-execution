@@ -66,6 +66,7 @@ func main() {
 		ConfigTag:         envStr("CONFIG_TAG", "v0.0.7"),
 		DebugMode:         envBool("DEBUG_MODE", true),
 		VerifyAttestation: envBool("VERIFY_ATTESTATION", false),
+		SkipJWTValidation: envBool("SKIP_JWT_VALIDATION", false),
 	}
 
 	// Snapshot storage lives at tinfoil-buckets. Default points at prod;
@@ -76,6 +77,9 @@ func main() {
 	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v debug=%v verify_attestation=%v",
 		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.DebugMode, cfg.VerifyAttestation)
 	log.Printf("orchestrator: repo=%s tag=%s", cfg.ConfigRepo, cfg.ConfigTag)
+	if cfg.SkipJWTValidation {
+		log.Printf("orchestrator: SKIP_JWT_VALIDATION=true — every tools/call accepted without JWT verification (DEV ONLY)")
+	}
 
 	mgr := NewManager(cfg)
 	mgr.StartPoolManager()

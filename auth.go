@@ -20,7 +20,13 @@ var ErrAuthRequired = errors.New("code execution requires a Clerk-authenticated 
 // AuthorizeSession verifies the request's bearer is a real Clerk JWT
 // via controlplane /api/auth/validate-jwt. No caching, no binding —
 // just a single round trip per tool call.
+//
+// Short-circuited to always pass when cfg.SkipJWTValidation is true
+// (SKIP_JWT_VALIDATION=true). Local-dev only.
 func (m *Manager) AuthorizeSession(ctx context.Context, bearer string) error {
+	if m.cfg.SkipJWTValidation {
+		return nil
+	}
 	if bearer == "" {
 		return ErrAuthRequired
 	}

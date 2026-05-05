@@ -33,6 +33,7 @@ go build .
 | `CONFIG_TAG`         | `v0.0.6`                               | Image tag                                                                     |
 | `DEBUG_MODE`         | `true`                                 | Pass `debug=true` to controlplane (enables SSH, modifies measurement)         |
 | `VERIFY_ATTESTATION` | `false`                                | Verify enclave attestation + pin TLS public key. Requires `DEBUG_MODE=false`. |
+| `SKIP_JWT_VALIDATION` | `false`                               | Local dev only — accept `tools/call` without a Clerk JWT. Never set in prod.  |
 
 ### API
 

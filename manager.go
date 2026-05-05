@@ -78,6 +78,11 @@ type ManagerConfig struct {
 	ConfigTag         string
 	DebugMode         bool
 	VerifyAttestation bool
+	// SkipJWTValidation short-circuits AuthorizeSession to always pass.
+	// For local dev only — flip via SKIP_JWT_VALIDATION=true so agent.py
+	// and similar tools can hit /mcp without forwarding a Clerk JWT.
+	// Default false; never enable in prod.
+	SkipJWTValidation bool
 	// IdleTimeout is how long a session can have no tool activity before
 	// the orchestrator snapshots and evicts the container.
 	IdleTimeout time.Duration
