@@ -21,7 +21,7 @@ import (
 var apiBase = "https://api.tinfoil.sh"
 
 // snapshotPutRetryDelay is how long evictAndSnapshot waits between
-// the first and second attempt to PUT a snapshot bundle to controlplane.
+// the first and second attempt to PUT a snapshot tar to buckets.
 // Variable so tests can shrink it.
 var snapshotPutRetryDelay = 1 * time.Second
 
@@ -42,8 +42,11 @@ type Container struct {
 
 	httpClient *http.Client // proxy client (attested or plain)
 
-	// Needed at eviction time to call the container's /snapshot endpoint, which wraps the DEK to it.
-	Pubkey string
+	// ExecKey is the user's symmetric AES-256 key (base64-encoded), cached
+	// from the request's X-Exec-Key header. The orchestrator uses it at
+	// eviction time to PUT the workspace tar to buckets under this key.
+	// The container itself never sees this value.
+	ExecKey string
 
 	// LastActivity is updated on every successful proxied tool call.
 	// The eviction loop uses it to decide when to snapshot+destroy.
@@ -135,8 +138,6 @@ func (m *Manager) apiRequest(method, path string, body any) (int, []byte, error)
 }
 
 // apiRequestWithHeaders is apiRequest plus caller-controlled headers.
-// Used for X-On-Behalf-Of on snapshot PUT/GET, where we authenticate as
-// admin but tell the controlplane which Clerk user the row belongs to.
 func (m *Manager) apiRequestWithHeaders(method, path string, body any, extra map[string]string) (int, []byte, error) {
 	var buf io.Reader
 	if body != nil {
@@ -428,27 +429,24 @@ func (m *Manager) poolManagerLoop() {
 // sees the in-memory hit and shares the same container. This prevents
 // double-assignment and double-restore.
 //
-// Per-request attrs are read from ctx (see WithSessionAttrs):
-//   - Pubkey is stamped onto c.Pubkey so the eviction loop can wrap a
-//     snapshot to it long after the request returns. We refresh on every
-//     call so a key rotation mid-session is picked up.
-//   - ResumeDEK, when present and the controlplane has a bundle, drives
-//     a fetch + decrypt + POST to the container's /restore BEFORE the
-//     container is returned. The executor closes its restore gate on the
-//     first non-/restore call, so this is the only safe point. The DEK
-//     never outlives the request — it lives on ctx and disappears with it.
+// The user's exec key (read from ctx via sessionExecKey) is cached on
+// c.ExecKey so the eviction loop can PUT the snapshot to buckets under
+// it long after the request returns. We refresh on every call so a key
+// rotation mid-session is picked up. When a key is present at assign
+// time we also try to restore from buckets — buckets returns 404 if no
+// snapshot exists yet, in which case we proceed with an empty workspace.
 func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected func() bool) (*Container, string) {
 	// Take the per-session lock first. This is the serialization point.
 	sl := m.lockSession(sessionID)
 	sl.Lock()
 	defer sl.Unlock()
 
-	pubkey := sessionPubkey(ctx)
+	execKey := sessionExecKey(ctx)
 
 	m.mu.Lock()
 	if c, ok := m.sessions[sessionID]; ok {
-		if pubkey != "" {
-			c.Pubkey = pubkey
+		if execKey != "" {
+			c.ExecKey = execKey
 		}
 		m.mu.Unlock()
 		return c, ""
@@ -482,20 +480,20 @@ func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected
 	c.Status = "assigning"
 	c.AssignedAt = time.Now()
 	c.LastActivity = time.Now()
-	if pubkey != "" {
-		c.Pubkey = pubkey
+	if execKey != "" {
+		c.ExecKey = execKey
 	}
 	m.mu.Unlock()
 
 	// Restore-on-assign. Failures here log and continue with an empty
 	// workspace — better than refusing to assign and breaking the user's
-	// chat entirely. (The webapp can surface a "restore failed" hint.)
-	if dek := sessionResumeDEK(ctx); dek != "" {
-		if err := m.restoreInto(ctx, sessionID, c, dek); err != nil {
+	// chat entirely.
+	if execKey != "" {
+		if err := m.restoreInto(ctx, sessionID, c, execKey); err != nil {
 			log.Printf("orchestrator: restore failed for session %s on %s: %v (continuing with empty workspace)",
 				sessionID, c.Name, err)
 		} else {
-			log.Printf("orchestrator: restored snapshot for session %s onto %s", sessionID, c.Name)
+			log.Printf("orchestrator: restore complete for session %s on %s", sessionID, c.Name)
 		}
 	}
 
@@ -510,58 +508,24 @@ func (m *Manager) GetOrAssign(ctx context.Context, sessionID string, isConnected
 	return c, ""
 }
 
-// restoreInto fetches the snapshot bundle for sessionID, decrypts the tar
-// using the orchestrator-passed resume DEK, and pushes plaintext into
-// the container's /restore. No-op if the controlplane has no bundle for
-// this session (returns nil; we just keep the empty workspace).
-//
-// The controlplane GET requires a fresh user JWT; we read it off ctx
-// (stamped by the MCP handler from the live request's Authorization
-// header). Empty bearer only happens on test paths that bypass MCP,
-// which run against fake controlplanes that don't enforce auth.
-func (m *Manager) restoreInto(ctx context.Context, sessionID string, c *Container, resumeDEKb64 string) error {
-	bundle, err := m.fetchSnapshotBundle(ctx, sessionID, sessionBearer(ctx))
+// restoreInto fetches the snapshot for sessionID from buckets (which
+// decrypts under execKeyB64) and pushes the plaintext tar into the
+// container's /restore. No-op when the bucket has no entry, or when
+// the supplied key can't open the entry — both surface as a fresh
+// empty workspace.
+func (m *Manager) restoreInto(ctx context.Context, sessionID string, c *Container, execKeyB64 string) error {
+	tarBytes, err := m.fetchSnapshotTar(ctx, sessionID, execKeyB64)
 	if err != nil {
-		return fmt.Errorf("fetch bundle: %w", err)
+		return fmt.Errorf("fetch snapshot: %w", err)
 	}
-	if bundle == nil {
-		// No snapshot in storage — fresh container, fine.
+	if tarBytes == nil {
+		// No snapshot (or unreadable with this key) — fresh container, fine.
 		return nil
 	}
-	ct, err := decodeBase64Lenient(bundle.Ciphertext)
-	if err != nil {
-		return fmt.Errorf("decode ciphertext: %w", err)
-	}
-	dek, err := decodeBase64Lenient(resumeDEKb64)
-	if err != nil {
-		return fmt.Errorf("decode dek: %w", err)
-	}
-	plain, err := decryptSnapshotTar(dek, ct)
-	if err != nil {
-		return fmt.Errorf("decrypt tar: %w", err)
-	}
-	if err := m.pushRestore(c, plain); err != nil {
+	if err := m.pushRestore(c, tarBytes); err != nil {
 		return fmt.Errorf("push restore: %w", err)
 	}
 	return nil
-}
-
-// decodeBase64Lenient accepts std, raw-std, url, or raw-url base64.
-// We do this because callers (webapp, controlplane) sometimes pad and
-// sometimes don't, and the snapshot wire format uses std encoding from
-// the executor while DEK headers from the webapp tend to be url-safe.
-func decodeBase64Lenient(s string) ([]byte, error) {
-	for _, enc := range []*base64.Encoding{
-		base64.StdEncoding,
-		base64.RawStdEncoding,
-		base64.URLEncoding,
-		base64.RawURLEncoding,
-	} {
-		if b, err := enc.DecodeString(s); err == nil {
-			return b, nil
-		}
-	}
-	return nil, fmt.Errorf("not valid base64")
 }
 
 func (m *Manager) CleanupSession(sessionID string) *Container {
@@ -582,40 +546,36 @@ func (m *Manager) CleanupSession(sessionID string) *Container {
 	return c
 }
 
-// evictAndSnapshot snapshots the container's workspace (if a pubkey was
-// cached) and PUTs the bundle to controlplane, then deletes the
-// container. Called by the idle-eviction loop. Snapshot failures still
-// destroy the container — losing state is bad, but leaving stale
-// containers around is worse and the user can always start fresh.
-//
-// The PUT carries X-On-Behalf-Of: <clerk_user_id> so the controlplane
-// scopes the row to the user that owns the session. The session was
-// already bound to a Clerk user at GetOrAssign time (AuthorizeSession
-// in the MCP path); empty here only on test scenarios.
+// evictAndSnapshot snapshots the container's workspace (if an exec key
+// was cached) and PUTs the plaintext tar to buckets, which encrypts it
+// under the cached key. Then deletes the container. Called by the
+// idle-eviction loop. Snapshot failures still destroy the container —
+// losing state is bad, but leaving stale containers around is worse
+// and the user can always start fresh.
 func (m *Manager) evictAndSnapshot(sessionID string, c *Container) {
-	if c.Pubkey != "" {
-		clerkUserID := m.SessionIdentity(sessionID)
-		bundle, err := m.fetchSnapshotFromContainer(c, c.Pubkey)
+	if c.ExecKey != "" {
+		ctx := context.Background()
+		tarBytes, err := m.fetchSnapshotFromContainer(c)
 		if err != nil {
 			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", sessionID, c.Name, err)
 		} else {
-			// One retry on transient PUT failure: a single controlplane blip
-			// shouldn't cost a user their workspace. Beyond that we accept the
-			// loss and the user starts fresh on next chat open.
-			putErr := m.putSnapshotBundle(sessionID, clerkUserID, bundle)
+			// One retry on transient PUT failure: a single buckets blip
+			// shouldn't cost a user their workspace. Beyond that we accept
+			// the loss and the user starts fresh on next chat open.
+			putErr := m.putSnapshotTar(ctx, sessionID, c.ExecKey, tarBytes)
 			if putErr != nil {
-				log.Printf("orchestrator: PUT snapshot bundle failed for session %s: %v — retrying once", sessionID, putErr)
+				log.Printf("orchestrator: PUT snapshot failed for session %s: %v — retrying once", sessionID, putErr)
 				time.Sleep(snapshotPutRetryDelay)
-				putErr = m.putSnapshotBundle(sessionID, clerkUserID, bundle)
+				putErr = m.putSnapshotTar(ctx, sessionID, c.ExecKey, tarBytes)
 			}
 			if putErr != nil {
-				log.Printf("orchestrator: PUT snapshot bundle failed for session %s after retry: %v", sessionID, putErr)
+				log.Printf("orchestrator: PUT snapshot failed for session %s after retry: %v", sessionID, putErr)
 			} else {
-				log.Printf("orchestrator: snapshotted session %s (container %s) to controlplane", sessionID, c.Name)
+				log.Printf("orchestrator: snapshotted session %s (container %s) to buckets", sessionID, c.Name)
 			}
 		}
 	} else {
-		log.Printf("orchestrator: no pubkey cached for session %s — skipping snapshot", sessionID)
+		log.Printf("orchestrator: no exec key cached for session %s — skipping snapshot", sessionID)
 	}
 	c.Status = "deleting"
 	m.deleteContainer(c.ID)
@@ -669,8 +629,6 @@ func (m *Manager) evictIdleSessions() {
 	for _, t := range targets {
 		log.Printf("orchestrator: idle-evicting session %s on %s (idle ~%v)",
 			t.sessionID, t.c.Name, m.cfg.IdleTimeout)
-		// evictAndSnapshot reads the bound identity for X-On-Behalf-Of,
-		// so we drop m.identities only after it returns.
 		m.evictAndSnapshot(t.sessionID, t.c)
 		m.mu.Lock()
 		delete(m.assignLocks, t.sessionID)

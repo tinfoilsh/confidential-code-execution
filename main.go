@@ -67,6 +67,10 @@ func main() {
 		DebugMode:         envBool("DEBUG_MODE", true),
 		VerifyAttestation: envBool("VERIFY_ATTESTATION", false),
 	}
+
+	// Snapshot storage lives at tinfoil-buckets. Default points at prod;
+	// override for local dev or staging via BUCKETS_BASE.
+	bucketsBase = envStr("BUCKETS_BASE", bucketsBase)
 	port := envInt("PORT", 7070)
 
 	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v debug=%v verify_attestation=%v",

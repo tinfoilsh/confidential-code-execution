@@ -2,28 +2,26 @@ package main
 
 // Orchestrator-side snapshot/restore helpers.
 //
-// The orchestrator is bytes-in/bytes-out from the controlplane's perspective:
-// it never tries to verify the ciphertext, only:
+// The bucket service
+// handles encryption end-to-end: callers pass plaintext + a 32-byte
+// symmetric key, the bucket encrypts under the key
+// and persists ciphertext in R2. We never see ciphertext.
 //
-//   1. on resume: pulls the bundle, peels off the wrappedDEK, AES-GCM-decrypts
-//      the tar with the unwrapped DEK provided by the webapp, and pushes the
-//      plaintext tar into the fresh container's /restore endpoint.
-//   2. on eviction: asks the container for {ciphertext, wrappedDEK}, PUTs the
-//      bundle to the controlplane, then destroys the container.
+// Flow:
 //
-// The bundle wire format is the executor's snapshotResponse JSON verbatim:
+//   1. on resume: GET /items/{sessionID} from buckets with the user's
+//      X-Encryption-Key, get plaintext tar back, push it into the fresh
+//      container's /restore endpoint before exposing it.
+//   2. on eviction: ask the container for a plaintext tar (its /snapshot
+//      now returns plaintext — encryption is upstream), PUT it to
+//      /items/{sessionID} with the cached exec key, then destroy the
+//      container.
 //
-//   { "ciphertext": "<base64-std>", "wrappedDEK": "<base64-std>" }
-//
-// where ciphertext is `nonce(12) || ct||tag` of the tar under the DEK
-// (matches executor/snapshot.go aesGCMEncrypt). The orchestrator stores it
-// as a single record so ciphertext and wrappedDEK can't get out of sync.
+// The container never sees the key; the orchestrator never sees ciphertext.
 
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -31,117 +29,77 @@ import (
 	"net/http"
 )
 
-// Per-request session attributes are passed down the call chain through
-// context. The MCP boundary reads X-Exec-Pubkey / X-Exec-Resume-Dek from
-// request headers and stashes them here; GetOrAssign reads them back at
-// the assign point. Lifetime is bounded by the request goroutine — when
-// the handler returns, the context is gone, so a stale DEK can't leak
-// into a later request.
+// bucketsBase is the tinfoil-buckets root. Override via env in main.go.
+var bucketsBase = "https://buckets.tinfoil.sh"
+
+// ctxKeyExecKey carries the user's symmetric exec key down the call
+// chain. The MCP boundary reads X-Exec-Key from the request and stashes
+// it here; GetOrAssign and the eviction path read it back. Lifetime is
+// bounded by the request goroutine — when the handler returns, the
+// context is gone, so a stale key can't leak into a later request.
 type ctxKey int
 
 const (
-	ctxKeyPubkey ctxKey = iota
-	ctxKeyResumeDEK
-	ctxKeyBearer
+	ctxKeyExecKey ctxKey = iota
 )
 
-// WithSessionAttrs returns a child context carrying the user pubkey,
-// optional resume DEK, and the user's bearer token. Empty values are
-// not stored, so callers downstream (GetOrAssign, restoreInto) see
-// them as absent. The bearer is used for the snapshot GET on the
-// restore-on-assign path — controlplane requires a fresh user JWT
-// for reads, which we have during a live tool/call request.
-func WithSessionAttrs(ctx context.Context, pubkey, resumeDEK, bearer string) context.Context {
-	if pubkey != "" {
-		ctx = context.WithValue(ctx, ctxKeyPubkey, pubkey)
-	}
-	if resumeDEK != "" {
-		ctx = context.WithValue(ctx, ctxKeyResumeDEK, resumeDEK)
-	}
-	if bearer != "" {
-		ctx = context.WithValue(ctx, ctxKeyBearer, bearer)
+// WithSessionAttrs returns a child context carrying the user's exec key.
+// Empty values are not stored.
+func WithSessionAttrs(ctx context.Context, execKey string) context.Context {
+	if execKey != "" {
+		ctx = context.WithValue(ctx, ctxKeyExecKey, execKey)
 	}
 	return ctx
 }
 
-func sessionPubkey(ctx context.Context) string {
-	v, _ := ctx.Value(ctxKeyPubkey).(string)
+func sessionExecKey(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyExecKey).(string)
 	return v
 }
 
-func sessionResumeDEK(ctx context.Context) string {
-	v, _ := ctx.Value(ctxKeyResumeDEK).(string)
-	return v
-}
-
-func sessionBearer(ctx context.Context) string {
-	v, _ := ctx.Value(ctxKeyBearer).(string)
-	return v
-}
-
-// snapshotBundle is what we PUT to and GET from the controlplane.
-// Same shape as the executor's snapshotResponse.
-type snapshotBundle struct {
-	Ciphertext string `json:"ciphertext"`
-	WrappedDEK string `json:"wrappedDEK"`
-}
-
-// decryptSnapshotTar reverses executor's aesGCMEncrypt: format is
-// nonce(12) || ciphertext_with_tag. dek must be 32 bytes (AES-256-GCM).
-func decryptSnapshotTar(dek, ciphertext []byte) ([]byte, error) {
-	if len(dek) != 32 {
-		return nil, fmt.Errorf("dek must be 32 bytes, got %d", len(dek))
+// decodeBase64Lenient accepts std, raw-std, url, or raw-url base64.
+// Webapp headers tend to be url-safe with no padding; std-encoded values
+// show up on the bucket wire format. Lets callers stay agnostic.
+func decodeBase64Lenient(s string) ([]byte, error) {
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		if b, err := enc.DecodeString(s); err == nil {
+			return b, nil
+		}
 	}
-	block, err := aes.NewCipher(dek)
+	return nil, fmt.Errorf("not valid base64")
+}
+
+// toStdBase64 normalizes any base64 variant to std (with padding).
+// Buckets only accepts std base64 in JSON bodies and the X-Encryption-Key
+// header, so we convert at the wire boundary.
+func toStdBase64(s string) (string, error) {
+	raw, err := decodeBase64Lenient(s)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(raw), nil
+}
+
+// fetchSnapshotTar pulls the plaintext tar for sessionID from buckets.
+// Returns (nil, nil) when the bucket has no entry for this sessionID
+// (404), or when the supplied key can't open the entry (403 — wrong
+// key or corrupt envelope). Both cases are non-fatal: GetOrAssign
+// proceeds with a fresh empty workspace.
+func (m *Manager) fetchSnapshotTar(ctx context.Context, sessionID, execKeyB64 string) ([]byte, error) {
+	keyStd, err := toStdBase64(execKeyB64)
+	if err != nil {
+		return nil, fmt.Errorf("decode exec key: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", bucketsBase+"/items/"+sessionID, nil)
 	if err != nil {
 		return nil, err
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	if len(ciphertext) < gcm.NonceSize()+gcm.Overhead() {
-		return nil, fmt.Errorf("ciphertext too short: %d", len(ciphertext))
-	}
-	nonce := ciphertext[:gcm.NonceSize()]
-	ct := ciphertext[gcm.NonceSize():]
-	plain, err := gcm.Open(nil, nonce, ct, nil)
-	if err != nil {
-		return nil, fmt.Errorf("aes-gcm open: %w", err)
-	}
-	return plain, nil
-}
-
-// onBehalfOfHeader formats the X-On-Behalf-Of header set on
-// admin-authed snapshot PUTs. Empty when no Clerk user is bound (which
-// shouldn't happen in production: AuthorizeSession rejects non-Clerk
-// traffic before a container is assigned. Empty here means the call
-// is from a path that never went through MCP — most likely a test).
-func onBehalfOfHeader(clerkUserID string) map[string]string {
-	if clerkUserID == "" {
-		return nil
-	}
-	return map[string]string{"X-On-Behalf-Of": clerkUserID}
-}
-
-// fetchSnapshotBundle pulls the full {ciphertext, wrappedDEK} bundle for
-// the given execSessionId from controlplane. Returns (nil, nil) if no
-// bundle exists (404).
-//
-// Uses the user's bearer JWT — controlplane scopes GETs by the JWT
-// subject and rejects admin-authed reads. This works because GETs only
-// run during a live tool/call request, when the user's JWT is fresh.
-// Empty bearer means we're in a test path that never went through MCP;
-// we still issue the request so existing tests against fake
-// controlplanes (which don't enforce auth) keep working.
-func (m *Manager) fetchSnapshotBundle(ctx context.Context, execSessionID, bearer string) (*snapshotBundle, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", apiBase+"/api/storage/exec-snapshot/"+execSessionID, nil)
-	if err != nil {
-		return nil, err
-	}
-	if bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+bearer)
-	}
+	req.Header.Set("X-Encryption-Key", keyStd)
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
 
 	resp, err := m.apiClient.Do(req)
@@ -150,29 +108,61 @@ func (m *Manager) fetchSnapshotBundle(ctx context.Context, execSessionID, bearer
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
 	}
+	if resp.StatusCode == http.StatusForbidden {
+		// Wrong key or corrupt envelope. Caller logs and starts fresh.
+		return nil, nil
+	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("controlplane GET snapshot %s: %d %s", execSessionID, resp.StatusCode, string(raw))
+		return nil, fmt.Errorf("buckets GET %s: %d %s", sessionID, resp.StatusCode, string(raw))
 	}
-	var b snapshotBundle
-	if err := json.Unmarshal(raw, &b); err != nil {
-		return nil, fmt.Errorf("decode bundle: %w", err)
+
+	var body struct {
+		Value string `json:"value"`
 	}
-	return &b, nil
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil, fmt.Errorf("decode bucket response: %w", err)
+	}
+	tarBytes, err := base64.StdEncoding.DecodeString(body.Value)
+	if err != nil {
+		return nil, fmt.Errorf("decode bucket value: %w", err)
+	}
+	return tarBytes, nil
 }
 
-// putSnapshotBundle uploads {ciphertext, wrappedDEK} to controlplane,
-// attributing the row to clerkUserID via X-On-Behalf-Of. Admin-authed:
-// PUTs run from the eviction loop, long after the user's JWT expired.
-func (m *Manager) putSnapshotBundle(execSessionID, clerkUserID string, b *snapshotBundle) error {
-	status, raw, err := m.apiRequestWithHeaders("PUT", "/api/storage/exec-snapshot/"+execSessionID, b, onBehalfOfHeader(clerkUserID))
+// putSnapshotTar PUTs the plaintext tar to buckets, encrypting under
+// execKeyB64. Buckets generates a fresh DEK per PUT (envelope v1) and
+// wraps it under the supplied key.
+func (m *Manager) putSnapshotTar(ctx context.Context, sessionID, execKeyB64 string, tarBytes []byte) error {
+	keyStd, err := toStdBase64(execKeyB64)
+	if err != nil {
+		return fmt.Errorf("decode exec key: %w", err)
+	}
+	body, err := json.Marshal(map[string]any{
+		"value":           base64.StdEncoding.EncodeToString(tarBytes),
+		"encryption_keys": []string{keyStd},
+	})
 	if err != nil {
 		return err
 	}
-	if status >= 400 {
-		return fmt.Errorf("controlplane PUT snapshot %s: %d %s", execSessionID, status, string(raw))
+	req, err := http.NewRequestWithContext(ctx, "PUT", bucketsBase+"/items/"+sessionID, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
+
+	resp, err := m.apiClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("buckets PUT %s: %d %s", sessionID, resp.StatusCode, string(raw))
 	}
 	return nil
 }
@@ -210,17 +200,14 @@ func (m *Manager) pushRestore(c *Container, plaintextTar []byte) error {
 	return nil
 }
 
-// fetchSnapshotFromContainer asks the running container for a snapshot
-// bundle, wrapped to the given user pubkey. Used on eviction.
-func (m *Manager) fetchSnapshotFromContainer(c *Container, userPubkeyB64 string) (*snapshotBundle, error) {
+// fetchSnapshotFromContainer asks the running container for a plaintext
+// tar of /workspace. Used on eviction. Encryption is handled by buckets,
+// not the container, so the container response is just {tar: <base64>}.
+func (m *Manager) fetchSnapshotFromContainer(c *Container) ([]byte, error) {
 	if c.httpClient == nil {
 		return nil, fmt.Errorf("no http client for container %s", c.Name)
 	}
-	body, err := json.Marshal(map[string]string{"pubkey": userPubkeyB64})
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequest("POST", "https://"+c.Domain+"/snapshot", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", "https://"+c.Domain+"/snapshot", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, err
 	}
@@ -234,12 +221,18 @@ func (m *Manager) fetchSnapshotFromContainer(c *Container, userPubkeyB64 string)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("snapshot returned %d: %s", resp.StatusCode, string(data))
 	}
-	var b snapshotBundle
-	if err := json.Unmarshal(data, &b); err != nil {
+	var body struct {
+		Tar string `json:"tar"`
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
 		return nil, fmt.Errorf("decode snapshot response: %w", err)
 	}
-	if b.Ciphertext == "" || b.WrappedDEK == "" {
-		return nil, fmt.Errorf("snapshot returned empty fields")
+	if body.Tar == "" {
+		return nil, fmt.Errorf("snapshot returned empty tar")
 	}
-	return &b, nil
+	tarBytes, err := base64.StdEncoding.DecodeString(body.Tar)
+	if err != nil {
+		return nil, fmt.Errorf("decode snapshot tar: %w", err)
+	}
+	return tarBytes, nil
 }

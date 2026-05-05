@@ -1,26 +1,19 @@
 package main
 
-// Minimal coverage for the orchestrator-side snapshot wiring:
+// Coverage for the orchestrator-side snapshot wiring against tinfoil-buckets:
 //
-//   - decryptSnapshotTar round-trips against the same nonce||ct||tag
-//     layout the executor's snapshot.go produces.
-//   - GetOrAssign with a resume DEK: fetches the bundle from a fake
-//     controlplane, decrypts, and POSTs the plaintext tar to the
-//     fake container's /restore.
-//   - evictAndSnapshot: pulls the bundle from the fake container's
-//     /snapshot and PUTs it to the fake controlplane.
+//   - decodeBase64Lenient round-trips std/url/raw variants.
+//   - GetOrAssign with an exec key: GETs the plaintext tar from a fake
+//     buckets server (which echoes back what was previously PUT under
+//     that key) and POSTs it to the fake container's /restore.
+//   - evictAndSnapshot: pulls a plaintext tar from the fake container's
+//     /snapshot and PUTs it to the fake buckets server.
 //   - Per-execSessionId serialization: two concurrent GetOrAssigns for
 //     the same session land on the same container.
-//
-// These don't try to be exhaustive — just enough that a refactor
-// breaking the wire format or the lock pattern fails fast.
 
 import (
 	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -33,50 +26,6 @@ import (
 	"testing"
 	"time"
 )
-
-// gcmSealStdLayout is the same nonce(12) || ct||tag construction the
-// executor uses, so we can build a "snapshot" that the orchestrator
-// must accept.
-func gcmSealStdLayout(t *testing.T, key, plaintext []byte) []byte {
-	t.Helper()
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		t.Fatal(err)
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		t.Fatal(err)
-	}
-	out := append([]byte{}, nonce...)
-	return gcm.Seal(out, nonce, plaintext, nil)
-}
-
-func TestDecryptSnapshotTarRoundTrip(t *testing.T) {
-	dek := make([]byte, 32)
-	if _, err := rand.Read(dek); err != nil {
-		t.Fatal(err)
-	}
-	plain := []byte("hello tar contents — pretend this is a real tar")
-	ct := gcmSealStdLayout(t, dek, plain)
-
-	got, err := decryptSnapshotTar(dek, ct)
-	if err != nil {
-		t.Fatalf("decrypt: %v", err)
-	}
-	if !bytes.Equal(got, plain) {
-		t.Fatalf("round trip mismatch:\nwant %q\n got %q", plain, got)
-	}
-
-	// Wrong key → AEAD failure, not a panic.
-	bad := make([]byte, 32)
-	if _, err := decryptSnapshotTar(bad, ct); err == nil {
-		t.Fatalf("expected AEAD failure with wrong key, got nil")
-	}
-}
 
 func TestDecodeBase64Lenient(t *testing.T) {
 	want := []byte{0x01, 0x02, 0x03, 0x04, 0xfe, 0xff}
@@ -99,19 +48,36 @@ func TestDecodeBase64Lenient(t *testing.T) {
 	}
 }
 
+func TestToStdBase64ConvertsURL(t *testing.T) {
+	want := []byte{0xfa, 0xfb, 0xfc, 0xfd}
+	urlForm := base64.RawURLEncoding.EncodeToString(want)
+	std, err := toStdBase64(urlForm)
+	if err != nil {
+		t.Fatalf("toStdBase64: %v", err)
+	}
+	got, err := base64.StdEncoding.DecodeString(std)
+	if err != nil {
+		t.Fatalf("std-decode: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("round trip mismatch: %x vs %x", got, want)
+	}
+}
+
 // fakeContainerServer stands in for a code-execution-environment
-// container. It exposes /restore (asserts on the tar bytes it sees)
-// and /snapshot (returns a canned bundle).
+// container. /restore records what plaintext tar arrives; /snapshot
+// returns a canned plaintext tar.
 type fakeContainerServer struct {
 	*httptest.Server
 	mu             sync.Mutex
-	gotRestoreTar  []byte // last tar plaintext POSTed to /restore
-	gotSnapshotPub string // last pubkey POSTed to /snapshot
-	snapshotResp   snapshotBundle
+	gotRestoreTar  []byte
+	snapshotTarB64 string
 }
 
-func newFakeContainer(snapshotResp snapshotBundle) *fakeContainerServer {
-	f := &fakeContainerServer{snapshotResp: snapshotResp}
+func newFakeContainer(snapshotTar []byte) *fakeContainerServer {
+	f := &fakeContainerServer{
+		snapshotTarB64: base64.StdEncoding.EncodeToString(snapshotTar),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/restore", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -133,64 +99,30 @@ func newFakeContainer(snapshotResp snapshotBundle) *fakeContainerServer {
 		fmt.Fprintln(w, `{"status":"ok"}`)
 	})
 	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
-		var body snapshotRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, err.Error(), 400)
-			return
-		}
-		f.mu.Lock()
-		f.gotSnapshotPub = body.Pubkey
-		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(f.snapshotResp)
+		json.NewEncoder(w).Encode(map[string]string{"tar": f.snapshotTarB64})
 	})
 	f.Server = httptest.NewServer(mux)
 	return f
 }
 
-// snapshotRequest is duplicated here to avoid importing the executor
-// package; same shape as the executor's. We only need the Pubkey field.
-type snapshotRequest struct {
-	Pubkey string `json:"pubkey"`
-}
-
 // fakeContainer returns a *Container whose proxy URL points at the
-// httptest server. The proxy + restore + snapshot helpers all build
-// "https://" + Domain + path, so we override Domain and inject an
-// httpClient with a custom dialer that strips https.
+// httptest server.
 func fakeContainer(f *fakeContainerServer) *Container {
 	u, _ := url.Parse(f.URL)
-	// Build an http.Client whose transport rewrites https://<Domain>/ to
-	// the test server. The simplest way is a transport with a Dial that
-	// overrides scheme; even simpler is to use the test server's URL
-	// directly as Domain and replace the proxy's "https://" construction
-	// — but the manager hardcodes https. So: custom Transport with
-	// DialContext that swallows the host + uses TLS-less net.Dial.
-	//
-	// Easiest path: just lie about Domain (use "x") and use a Transport
-	// that always reroutes to the test server.
-	transport := &http.Transport{
-		DialTLS:             nil,
-		DisableKeepAlives:   true,
-		MaxIdleConnsPerHost: 1,
-	}
-	// Override the dial so https://x/path actually reaches the test
-	// server. We do this by giving the http.Client a custom RoundTripper.
 	rt := rewritingTransport{target: u}
-	c := &Container{
+	return &Container{
 		ID:         "fake",
 		Name:       "fake-container",
 		Domain:     "fake.invalid",
 		Status:     "ready",
 		httpClient: &http.Client{Transport: rt, Timeout: 5 * time.Second},
 	}
-	_ = transport // unused; rewritingTransport handles everything
-	return c
 }
 
-// rewritingTransport rewrites any incoming request to hit the test
-// server URL, preserving path/method/body/headers. Lets us point the
-// orchestrator's "https://<container.Domain>/restore" at httptest.
+// rewritingTransport reroutes any request to the test server, regardless
+// of the URL it was built with. Lets us point "https://<container.Domain>"
+// at httptest without TLS.
 type rewritingTransport struct {
 	target *url.URL
 }
@@ -203,91 +135,116 @@ func (rt rewritingTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 	return http.DefaultTransport.RoundTrip(r2)
 }
 
-// fakeControlplane stands in for api.tinfoil.sh. Records PUT bodies and
-// serves a canned snapshot bundle on GET. It also accepts the warm-pool
-// management endpoints (POST /api/containers, GET /api/containers/{id})
-// so the manager can be exercised end-to-end without real infra.
-type fakeControlplane struct {
+// fakeBuckets stands in for buckets.tinfoil.sh. Stores plaintext blobs
+// per (lookupKey, key) pair — we don't actually encrypt; we just verify
+// PUT/GET symmetry under the same key. Wrong-key GETs return 403,
+// matching real buckets behavior.
+type fakeBuckets struct {
 	*httptest.Server
 	mu                   sync.Mutex
-	getBundle            *snapshotBundle // returned for GET /api/storage/exec-snapshot/*
-	putBundles           map[string]snapshotBundle
-	putFailuresRemaining int // when > 0, PUT returns 500 and decrements
-	putAttempts          int // total PUT requests received (success + failure)
+	putAttempts          int
+	putFailuresRemaining int
+	// stored maps lookupKey → (key, plaintext). Single-key per item is
+	// fine for these tests.
+	stored map[string]storedBlob
 }
 
-func newFakeControlplane(getBundle *snapshotBundle) *fakeControlplane {
-	cp := &fakeControlplane{getBundle: getBundle, putBundles: map[string]snapshotBundle{}}
+type storedBlob struct {
+	key       string // base64 std
+	plaintext []byte
+}
+
+func newFakeBuckets() *fakeBuckets {
+	b := &fakeBuckets{stored: map[string]storedBlob{}}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/storage/exec-snapshot/", func(w http.ResponseWriter, r *http.Request) {
-		id := strings.TrimPrefix(r.URL.Path, "/api/storage/exec-snapshot/")
+	mux.HandleFunc("/items/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/items/")
 		switch r.Method {
 		case "GET":
-			cp.mu.Lock()
-			b := cp.getBundle
-			cp.mu.Unlock()
-			if b == nil {
-				w.WriteHeader(404)
+			key := r.Header.Get("X-Encryption-Key")
+			b.mu.Lock()
+			blob, ok := b.stored[id]
+			b.mu.Unlock()
+			if !ok {
+				http.Error(w, "lookup_key not found", 404)
+				return
+			}
+			if blob.key != key {
+				http.Error(w, "wrong key", 403)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(b)
+			json.NewEncoder(w).Encode(map[string]string{
+				"value": base64.StdEncoding.EncodeToString(blob.plaintext),
+			})
 		case "PUT":
 			data, _ := io.ReadAll(r.Body)
-			var b snapshotBundle
-			if err := json.Unmarshal(data, &b); err != nil {
+			var body struct {
+				Value          string   `json:"value"`
+				EncryptionKeys []string `json:"encryption_keys"`
+			}
+			if err := json.Unmarshal(data, &body); err != nil {
 				http.Error(w, err.Error(), 400)
 				return
 			}
-			cp.mu.Lock()
-			cp.putAttempts++
-			if cp.putFailuresRemaining > 0 {
-				cp.putFailuresRemaining--
-				cp.mu.Unlock()
+			b.mu.Lock()
+			b.putAttempts++
+			if b.putFailuresRemaining > 0 {
+				b.putFailuresRemaining--
+				b.mu.Unlock()
 				http.Error(w, "simulated transient failure", 500)
 				return
 			}
-			cp.putBundles[id] = b
-			cp.mu.Unlock()
-			w.WriteHeader(204)
+			pt, err := base64.StdEncoding.DecodeString(body.Value)
+			if err != nil {
+				b.mu.Unlock()
+				http.Error(w, "bad b64", 400)
+				return
+			}
+			if len(body.EncryptionKeys) == 0 {
+				b.mu.Unlock()
+				http.Error(w, "no key", 400)
+				return
+			}
+			b.stored[id] = storedBlob{key: body.EncryptionKeys[0], plaintext: pt}
+			b.mu.Unlock()
+			w.WriteHeader(200)
+			fmt.Fprintln(w, `{}`)
 		default:
 			w.WriteHeader(405)
 		}
 	})
-	cp.Server = httptest.NewServer(mux)
-	return cp
+	b.Server = httptest.NewServer(mux)
+	return b
 }
 
 func TestRestoreOnAssign(t *testing.T) {
-	// Build a "snapshot" the way the executor would: encrypt some plaintext
-	// tar bytes with a DEK, then base64 it. Stick it in a fake
-	// controlplane bundle.
 	plainTar := []byte("PRETEND-TAR-BYTES")
-	dek := make([]byte, 32)
-	rand.Read(dek)
-	ct := gcmSealStdLayout(t, dek, plainTar)
-	bundle := &snapshotBundle{
-		Ciphertext: base64.StdEncoding.EncodeToString(ct),
-		WrappedDEK: "wrapped-not-used-in-this-test",
-	}
 
-	cp := newFakeControlplane(bundle)
-	defer cp.Close()
-	prev := apiBase
-	apiBase = cp.URL
-	defer func() { apiBase = prev }()
+	bk := newFakeBuckets()
+	defer bk.Close()
+	prev := bucketsBase
+	bucketsBase = bk.URL
+	defer func() { bucketsBase = prev }()
 
-	fc := newFakeContainer(snapshotBundle{})
+	// Pre-load the bucket with a snapshot for sess-1, encrypted under
+	// the user's key. (fake bucket stores std-base64 of the key.)
+	keyRaw := bytes.Repeat([]byte{0xab}, 32)
+	keyStd := base64.StdEncoding.EncodeToString(keyRaw)
+	keyURL := base64.RawURLEncoding.EncodeToString(keyRaw)
+	bk.mu.Lock()
+	bk.stored["sess-1"] = storedBlob{key: keyStd, plaintext: plainTar}
+	bk.mu.Unlock()
+
+	fc := newFakeContainer(nil)
 	defer fc.Close()
 	c := fakeContainer(fc)
 
 	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 1, MaxContainers: 4, IdleTimeout: time.Hour})
-	// Pre-seed the warm pool with our fake container so GetOrAssign
-	// pulls it and runs restore.
 	m.warmPool = []*Container{c}
 
-	ctx := WithSessionAttrs(context.Background(),
-		"cGstYjY0", base64.StdEncoding.EncodeToString(dek), "")
+	// Webapp sends url-safe base64; orchestrator should normalize.
+	ctx := WithSessionAttrs(context.Background(), keyURL)
 
 	got, errMsg := m.GetOrAssign(ctx, "sess-1", nil)
 	if got == nil {
@@ -300,69 +257,87 @@ func TestRestoreOnAssign(t *testing.T) {
 	if !bytes.Equal(gotTar, plainTar) {
 		t.Fatalf("restore did not deliver plaintext tar to container.\nwant %q\n got %q", plainTar, gotTar)
 	}
-	if got.Pubkey != "cGstYjY0" {
-		t.Fatalf("pubkey not cached on container: %q", got.Pubkey)
+	if got.ExecKey != keyURL {
+		t.Fatalf("exec key not cached on container: %q", got.ExecKey)
+	}
+}
+
+func TestRestoreOnAssignNoSnapshot(t *testing.T) {
+	// No snapshot in buckets → 404 → fresh container, /restore not called.
+	bk := newFakeBuckets()
+	defer bk.Close()
+	prev := bucketsBase
+	bucketsBase = bk.URL
+	defer func() { bucketsBase = prev }()
+
+	fc := newFakeContainer(nil)
+	defer fc.Close()
+	c := fakeContainer(fc)
+
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 1, MaxContainers: 4, IdleTimeout: time.Hour})
+	m.warmPool = []*Container{c}
+
+	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
+	ctx := WithSessionAttrs(context.Background(), keyURL)
+
+	if got, errMsg := m.GetOrAssign(ctx, "sess-fresh", nil); got == nil {
+		t.Fatalf("GetOrAssign failed: %s", errMsg)
+	}
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.gotRestoreTar != nil {
+		t.Fatalf("expected no restore call for missing snapshot, got tar of %d bytes", len(fc.gotRestoreTar))
 	}
 }
 
 func TestEvictAndSnapshot(t *testing.T) {
-	// Fake container that returns a canned snapshot bundle.
-	fc := newFakeContainer(snapshotBundle{
-		Ciphertext: "Y2lwaGVydGV4dA==",
-		WrappedDEK: "d3JhcHBlZA==",
-	})
+	plainTar := []byte("workspace-tar-bytes")
+
+	fc := newFakeContainer(plainTar)
 	defer fc.Close()
 	c := fakeContainer(fc)
-	c.Pubkey = "user-pub-b64url"
 
-	cp := newFakeControlplane(nil)
-	defer cp.Close()
-	prev := apiBase
-	apiBase = cp.URL
-	defer func() { apiBase = prev }()
+	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
+	keyStd, _ := toStdBase64(keyURL)
+	c.ExecKey = keyURL
+
+	bk := newFakeBuckets()
+	defer bk.Close()
+	prev := bucketsBase
+	bucketsBase = bk.URL
+	defer func() { bucketsBase = prev }()
 
 	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
-	// Override deleteContainer side effect path: we don't have a real
-	// container to delete; the fake controlplane just 405s on
-	// /api/containers/* which is fine — the call returns and we move on.
 	m.evictAndSnapshot("sess-evict", c)
 
-	cp.mu.Lock()
-	got, ok := cp.putBundles["sess-evict"]
-	cp.mu.Unlock()
+	bk.mu.Lock()
+	stored, ok := bk.stored["sess-evict"]
+	bk.mu.Unlock()
 	if !ok {
-		t.Fatalf("controlplane never received PUT bundle")
+		t.Fatalf("buckets never received PUT")
 	}
-	if got.Ciphertext != "Y2lwaGVydGV4dA==" || got.WrappedDEK != "d3JhcHBlZA==" {
-		t.Fatalf("PUT bundle mismatch: %+v", got)
+	if !bytes.Equal(stored.plaintext, plainTar) {
+		t.Fatalf("PUT plaintext mismatch: got %q want %q", stored.plaintext, plainTar)
 	}
-
-	fc.mu.Lock()
-	gotPub := fc.gotSnapshotPub
-	fc.mu.Unlock()
-	if gotPub != "user-pub-b64url" {
-		t.Fatalf("container /snapshot got wrong pubkey: %q", gotPub)
+	if stored.key != keyStd {
+		t.Fatalf("PUT key not normalized to std-base64: got %q want %q", stored.key, keyStd)
 	}
 }
 
 func TestEvictAndSnapshotPutRetry(t *testing.T) {
-	// First PUT attempt fails with 500; the bounded retry then succeeds and
-	// the bundle lands in storage. Verifies evictAndSnapshot retries once on
-	// transient PUT failure rather than dropping the workspace.
-	fc := newFakeContainer(snapshotBundle{
-		Ciphertext: "Y2lwaGVydGV4dA==",
-		WrappedDEK: "d3JhcHBlZA==",
-	})
+	// First PUT fails 500; the bounded retry succeeds.
+	fc := newFakeContainer([]byte("tar-bytes"))
 	defer fc.Close()
 	c := fakeContainer(fc)
-	c.Pubkey = "user-pub-b64url"
+	c.ExecKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x22}, 32))
 
-	cp := newFakeControlplane(nil)
-	cp.putFailuresRemaining = 1
-	defer cp.Close()
-	prev := apiBase
-	apiBase = cp.URL
-	defer func() { apiBase = prev }()
+	bk := newFakeBuckets()
+	bk.putFailuresRemaining = 1
+	defer bk.Close()
+	prev := bucketsBase
+	bucketsBase = bk.URL
+	defer func() { bucketsBase = prev }()
 
 	prevDelay := snapshotPutRetryDelay
 	snapshotPutRetryDelay = 0
@@ -371,29 +346,29 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
 	m.evictAndSnapshot("sess-retry", c)
 
-	cp.mu.Lock()
-	attempts := cp.putAttempts
-	_, stored := cp.putBundles["sess-retry"]
-	cp.mu.Unlock()
+	bk.mu.Lock()
+	attempts := bk.putAttempts
+	_, stored := bk.stored["sess-retry"]
+	bk.mu.Unlock()
 	if attempts != 2 {
 		t.Fatalf("expected exactly 2 PUT attempts (1 fail + 1 retry), got %d", attempts)
 	}
 	if !stored {
-		t.Fatalf("bundle not stored after retry")
+		t.Fatalf("blob not stored after retry")
 	}
 }
 
 func TestPerSessionSerialization(t *testing.T) {
-	// No resume DEK → restore is skipped, GetOrAssign just pulls from
+	// No exec key → restore is skipped, GetOrAssign just pulls from
 	// warm pool. Two goroutines racing for the same session should both
 	// see the same container.
-	cp := newFakeControlplane(nil)
-	defer cp.Close()
-	prev := apiBase
-	apiBase = cp.URL
-	defer func() { apiBase = prev }()
+	bk := newFakeBuckets()
+	defer bk.Close()
+	prev := bucketsBase
+	bucketsBase = bk.URL
+	defer func() { bucketsBase = prev }()
 
-	fc := newFakeContainer(snapshotBundle{})
+	fc := newFakeContainer(nil)
 	defer fc.Close()
 	c1 := fakeContainer(fc)
 	c1.Name = "first"
@@ -422,7 +397,6 @@ func TestPerSessionSerialization(t *testing.T) {
 		t.Fatalf("expected both racers to get same container, got %s and %s",
 			results[0].Name, results[1].Name)
 	}
-	// Warm pool should still have one container left (the second one).
 	m.mu.Lock()
 	left := len(m.warmPool)
 	m.mu.Unlock()

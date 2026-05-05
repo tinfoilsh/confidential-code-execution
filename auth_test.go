@@ -107,8 +107,11 @@ func TestAuthorizeSession_BindsAndCaches(t *testing.T) {
 		t.Fatalf("repeat call must not re-hit whoami; got %d total calls", got)
 	}
 
-	if got := m.SessionIdentity("sess"); got != "user_alice" {
-		t.Fatalf("SessionIdentity = %q, want user_alice", got)
+	m.mu.Lock()
+	bound := m.identities["sess"]
+	m.mu.Unlock()
+	if bound == nil || bound.clerkUserID != "user_alice" {
+		t.Fatalf("identities[sess] = %+v, want clerkUserID=user_alice", bound)
 	}
 }
 

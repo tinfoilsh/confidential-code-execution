@@ -29,9 +29,9 @@ type rpcError struct {
 // Returns (status, response). If response is nil, the request was a notification.
 //
 // ctx is the per-request context — pass r.Context() from the HTTP handler.
-// Per-session attrs (pubkey, resume DEK) are stamped onto a child context
-// via WithSessionAttrs and read back at the GetOrAssign call site, so
-// they live exactly as long as the request goroutine.
+// The user's symmetric exec key is stamped onto a child context via
+// WithSessionAttrs and read back at the GetOrAssign call site, so it
+// lives exactly as long as the request goroutine.
 func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req jsonRPCRequest) (int, *jsonRPCResponse) {
 	// Notifications have no id
 	if req.ID == nil {
@@ -80,17 +80,11 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 				return http.StatusInternalServerError, resp
 			}
 		}
-		// Stash per-request attrs on ctx. X-Exec-Pubkey is what
-		// GetOrAssign stamps onto c.Pubkey so eviction-time snapshotting
-		// can wrap the DEK to it. X-Exec-Resume-Dek, when present, tells
-		// GetOrAssign to fetch + decrypt + push the snapshot tar into the
-		// fresh container's /restore before the first tool call exposes it.
-		// The bearer rides along too — restoreInto needs it to JWT-auth
-		// the snapshot GET against controlplane (admin GETs are rejected).
-		ctx = WithSessionAttrs(ctx,
-			headers.Get("X-Exec-Pubkey"),
-			headers.Get("X-Exec-Resume-Dek"),
-			bearer)
+		// Stash the exec key on ctx. GetOrAssign reads it back to (a) cache
+		// it on c.ExecKey for eviction-time encryption via buckets, and
+		// (b) drive the restore-on-assign fetch from buckets before the
+		// fresh container is exposed to traffic.
+		ctx = WithSessionAttrs(ctx, headers.Get("X-Exec-Key"))
 		name, _ := req.Params["name"].(string)
 		args, _ := req.Params["arguments"].(map[string]any)
 		handler, ok := ToolHandlers[name]

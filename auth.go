@@ -5,9 +5,9 @@ package main
 // the controlplane's /api/auth/whoami endpoint to avoid embedding the
 // Clerk SDK across services. Once verified, the (sessionID → user)
 // binding lives on Manager.identities; subsequent calls with a
-// different verified identity are rejected, and snapshots are
-// attributed to the bound user via X-On-Behalf-Of on the
-// controlplane PUT.
+// different verified identity are rejected. The binding has no role
+// in storage — buckets is keyed only by sessionID + the user's
+// symmetric key, with no per-user attribution column.
 
 import (
 	"context"
@@ -113,18 +113,6 @@ func (m *Manager) whoami(ctx context.Context, bearer string) (string, error) {
 		return "", fmt.Errorf("decode whoami: %w", err)
 	}
 	return body.ClerkUserID, nil
-}
-
-// SessionIdentity returns the bound Clerk user ID for a session, or
-// "" if none is bound. Used at restore/eviction time so the snapshot
-// PUT/GET can carry X-On-Behalf-Of.
-func (m *Manager) SessionIdentity(sessionID string) string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if id, ok := m.identities[sessionID]; ok {
-		return id.clerkUserID
-	}
-	return ""
 }
 
 // extractBearer pulls the token out of an Authorization header, or
