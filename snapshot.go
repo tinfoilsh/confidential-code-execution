@@ -174,7 +174,10 @@ func (m *Manager) putSnapshotTar(ctx context.Context, accessToken, codeExecution
 // before any user traffic touches the container.
 //
 // Body shape matches executor/snapshot.go's restoreRequest: {tar: <base64>}.
-func (m *Manager) pushRestore(c *Container, plaintextTar []byte) error {
+// The api-server token gate also gets its first claim from this call when
+// there's a snapshot to restore; on a 403 the recordContainerStatus path
+// counts toward the consecutive-403s threshold like any other call.
+func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []byte) error {
 	if c.httpClient == nil {
 		return fmt.Errorf("no http client for container %s", c.Name)
 	}
@@ -189,12 +192,14 @@ func (m *Manager) pushRestore(c *Container, plaintextTar []byte) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("restore POST: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("restore returned %d: %s", resp.StatusCode, string(data))
 	}
@@ -204,7 +209,7 @@ func (m *Manager) pushRestore(c *Container, plaintextTar []byte) error {
 // fetchSnapshotFromContainer asks the running container for a plaintext
 // tar of /workspace. Used on eviction. Encryption is handled by buckets,
 // not the container, so the container response is just {tar: <base64>}.
-func (m *Manager) fetchSnapshotFromContainer(c *Container) ([]byte, error) {
+func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) ([]byte, error) {
 	if c.httpClient == nil {
 		return nil, fmt.Errorf("no http client for container %s", c.Name)
 	}
@@ -213,12 +218,14 @@ func (m *Manager) fetchSnapshotFromContainer(c *Container) ([]byte, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot POST: %w", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("snapshot returned %d: %s", resp.StatusCode, string(data))
 	}

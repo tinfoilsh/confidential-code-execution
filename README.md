@@ -16,8 +16,8 @@ go run .
 Or build a binary:
 
 ```bash
-go build -o orchestrator .
-./orchestrator
+go build .
+./confidential-code-execution
 ```
 
 ### Environment variables

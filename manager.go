@@ -52,6 +52,14 @@ type Container struct {
 	// LastActivity is updated on every successful proxied tool call.
 	// The eviction loop uses it to decide when to snapshot+destroy.
 	LastActivity time.Time
+
+	// Consecutive403s counts back-to-back 403 responses from the
+	// executor's api-server token gate. Two in a row means the container
+	// has a different access token claimed than what we're sending —
+	// almost certainly a poisoned warm-pool container or session-map
+	// drift. recordContainerStatus tears it down at the threshold.
+	// Reset on any 2xx. Guarded by Manager.mu.
+	Consecutive403s int
 }
 
 type ManagerConfig struct {
@@ -523,7 +531,7 @@ func (m *Manager) restoreInto(ctx context.Context, accessToken string, c *Contai
 		// No snapshot (or unreadable with this key) — fresh container, fine.
 		return nil
 	}
-	if err := m.pushRestore(c, tarBytes); err != nil {
+	if err := m.pushRestore(c, accessToken, tarBytes); err != nil {
 		return fmt.Errorf("push restore: %w", err)
 	}
 	return nil
@@ -555,7 +563,7 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 	if c.CodeExecutionEncryptionKey != "" {
 		ctx := context.Background()
-		tarBytes, err := m.fetchSnapshotFromContainer(c)
+		tarBytes, err := m.fetchSnapshotFromContainer(c, accessToken)
 		if err != nil {
 			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", accessToken, c.Name, err)
 		} else {
@@ -676,7 +684,7 @@ func (m *Manager) Finish() map[string]any {
 // Container proxy + high-level operations
 // ---------------------------------------------------------------------------
 
-func (m *Manager) proxy(ctx context.Context, c *Container, path string, body []byte) (int, []byte, error) {
+func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path string, body []byte) (int, []byte, error) {
 	if c.httpClient == nil {
 		return 0, nil, fmt.Errorf("no http client for container %s", c.Name)
 	}
@@ -688,6 +696,7 @@ func (m *Manager) proxy(ctx context.Context, c *Container, path string, body []b
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return 502, []byte(fmt.Sprintf(`{"error":"container unavailable: %s"}`, err)), nil
@@ -698,7 +707,35 @@ func (m *Manager) proxy(ctx context.Context, c *Container, path string, body []b
 	// uses this to compute idleness, so we want it bumped even on
 	// non-2xx responses (the user is still interacting with us).
 	c.LastActivity = time.Now()
+	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	return resp.StatusCode, data, nil
+}
+
+// recordContainerStatus updates the consecutive-403s counter on c after a
+// container-bound call. 2xx resets to 0; 403 increments and triggers
+// CleanupSession at threshold. Other status codes (incl. 401, which
+// would be an orchestrator bug not a poisoned container) are ignored.
+//
+// Invoked by every path that talks to the executor: proxy (exec/read/
+// write), pushRestore, fetchSnapshotFromContainer.
+func (m *Manager) recordContainerStatus(accessToken string, c *Container, status int) {
+	if status >= 200 && status < 300 {
+		m.mu.Lock()
+		c.Consecutive403s = 0
+		m.mu.Unlock()
+		return
+	}
+	if status != http.StatusForbidden {
+		return
+	}
+	m.mu.Lock()
+	c.Consecutive403s++
+	n := c.Consecutive403s
+	m.mu.Unlock()
+	if n >= 2 {
+		log.Printf("orchestrator: container %s rejected access token for session %s twice — destroying", c.Name, accessToken)
+		m.CleanupSession(accessToken)
+	}
 }
 
 // ExecCommand runs a bash command in the session's container.
@@ -708,7 +745,7 @@ func (m *Manager) ExecCommand(ctx context.Context, accessToken, command string) 
 		return map[string]any{"error": errMsg}
 	}
 	body, _ := json.Marshal(map[string]string{"command": command})
-	status, raw, _ := m.proxy(ctx, c, "/exec", body)
+	status, raw, _ := m.proxy(ctx, c, accessToken, "/exec", body)
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status), "raw": string(raw)}
@@ -723,7 +760,7 @@ func (m *Manager) ReadFile(ctx context.Context, accessToken, path string) (strin
 		return "", fmt.Errorf("%s", errMsg)
 	}
 	body, _ := json.Marshal(map[string]string{"path": path})
-	_, raw, _ := m.proxy(ctx, c, "/read", body)
+	_, raw, _ := m.proxy(ctx, c, accessToken, "/read", body)
 	var resp struct {
 		Contents string `json:"contents"`
 		Error    string `json:"error"`
@@ -749,7 +786,7 @@ func (m *Manager) WriteFile(ctx context.Context, accessToken, path, content stri
 	}
 	encoded := base64.StdEncoding.EncodeToString([]byte(content))
 	body, _ := json.Marshal(map[string]string{"path": path, "contents": encoded})
-	status, raw, _ := m.proxy(ctx, c, "/write", body)
+	status, raw, _ := m.proxy(ctx, c, accessToken, "/write", body)
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status)}

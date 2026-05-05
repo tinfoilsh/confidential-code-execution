@@ -1,12 +1,11 @@
 package main
 
-// Tests for the orchestrator's Clerk JWT gate. The whoami round trip
-// is faked with a stub controlplane so we can exercise auth without a
-// live Clerk verifier.
+// Tests for the orchestrator's Clerk JWT gate. The validate-jwt round
+// trip is faked with a stub controlplane so we can exercise auth
+// without a live Clerk verifier.
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -15,24 +14,23 @@ import (
 	"time"
 )
 
-// newFakeWhoami stands in for controlplane's GET /api/auth/whoami.
-// Maps known bearer tokens to Clerk user IDs; anything else 401s.
-func newFakeWhoami(users map[string]string) *httptest.Server {
+// newFakeValidateJWT stands in for controlplane's GET
+// /api/auth/validate-jwt. Returns 200 for any bearer in `valid`,
+// 401 otherwise.
+func newFakeValidateJWT(valid map[string]bool) *httptest.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/auth/whoami", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/auth/validate-jwt", func(w http.ResponseWriter, r *http.Request) {
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
 			http.Error(w, "missing bearer", http.StatusUnauthorized)
 			return
 		}
 		token := strings.TrimPrefix(auth, "Bearer ")
-		userID, ok := users[token]
-		if !ok {
+		if !valid[token] {
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"clerk_user_id": userID})
+		w.WriteHeader(http.StatusOK)
 	})
 	return httptest.NewServer(mux)
 }
@@ -46,7 +44,7 @@ func newAuthTestManager(t *testing.T, cpURL string) *Manager {
 }
 
 func TestAuthorizeSession_EmptyBearer(t *testing.T) {
-	cp := newFakeWhoami(nil)
+	cp := newFakeValidateJWT(nil)
 	defer cp.Close()
 	m := newAuthTestManager(t, cp.URL)
 
@@ -56,7 +54,7 @@ func TestAuthorizeSession_EmptyBearer(t *testing.T) {
 }
 
 func TestAuthorizeSession_ControlplaneRejects(t *testing.T) {
-	cp := newFakeWhoami(map[string]string{}) // every token 401s
+	cp := newFakeValidateJWT(map[string]bool{}) // every token 401s
 	defer cp.Close()
 	m := newAuthTestManager(t, cp.URL)
 
@@ -66,7 +64,7 @@ func TestAuthorizeSession_ControlplaneRejects(t *testing.T) {
 }
 
 func TestAuthorizeSession_ValidBearer(t *testing.T) {
-	cp := newFakeWhoami(map[string]string{"jwt-A": "user_alice"})
+	cp := newFakeValidateJWT(map[string]bool{"jwt-A": true})
 	defer cp.Close()
 	m := newAuthTestManager(t, cp.URL)
 
