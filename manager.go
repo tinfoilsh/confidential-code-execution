@@ -17,8 +17,9 @@ import (
 	"github.com/tinfoilsh/verifier/client"
 )
 
-// apiBase is the controlplane root for /api/* calls.
-var apiBase = "https://api.tinfoil.sh"
+// apiBase is the controlplane root for /api/* calls. Overridable via
+// CONTROL_PLANE_URL env var
+var apiBase = envStr("CONTROL_PLANE_URL", "https://api.tinfoil.sh")
 
 // snapshotPutRetryDelay is how long evictAndSnapshot waits between
 // the first and second attempt to PUT a snapshot tar to buckets.
