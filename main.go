@@ -58,15 +58,16 @@ func main() {
 	}
 
 	cfg := ManagerConfig{
-		AdminAPIKey:       adminAPIKey,
-		PoolSize:          envInt("POOL_SIZE", 3),
-		MaxContainers:     envInt("MAX_CONTAINERS", 10),
-		PollInterval:      time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
-		ConfigRepo:        envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
-		ConfigTag:         envStr("CONFIG_TAG", "v0.0.8"),
-		DebugMode:         envBool("DEBUG_MODE", true),
-		VerifyAttestation: envBool("VERIFY_ATTESTATION", false),
-		SkipJWTValidation: envBool("SKIP_JWT_VALIDATION", true),
+		AdminAPIKey:         adminAPIKey,
+		PoolSize:            envInt("POOL_SIZE", 3),
+		MaxContainers:       envInt("MAX_CONTAINERS", 10),
+		PollInterval:        time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
+		ConfigRepo:          envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
+		ConfigTag:           envStr("CONFIG_TAG", "v0.0.8"),
+		DebugMode:           envBool("DEBUG_MODE", true),
+		VerifyAttestation:   envBool("VERIFY_ATTESTATION", false),
+		SkipJWTValidation:   envBool("SKIP_JWT_VALIDATION", true),
+		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
 	}
 
 	// Snapshot storage lives at tinfoil-buckets. Default points at prod;

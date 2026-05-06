@@ -89,6 +89,11 @@ type ManagerConfig struct {
 	// EvictionPoll is how often the eviction loop wakes up to scan
 	// sessions. Roughly IdleTimeout / 10.
 	EvictionPoll time.Duration
+	// WarmPoolWaitTimeout caps how long GetOrAssign blocks waiting for a
+	// container when the warm pool is empty. Past the cap, the call
+	// returns "no containers available" so the client gets a fast error
+	// instead of an indefinite spinner.
+	WarmPoolWaitTimeout time.Duration
 }
 
 type Manager struct {
@@ -110,10 +115,13 @@ type Manager struct {
 
 func NewManager(cfg ManagerConfig) *Manager {
 	if cfg.IdleTimeout == 0 {
-		cfg.IdleTimeout = 10 * time.Minute
+		cfg.IdleTimeout = 1 * time.Minute
 	}
 	if cfg.EvictionPoll == 0 {
 		cfg.EvictionPoll = 30 * time.Second
+	}
+	if cfg.WarmPoolWaitTimeout == 0 {
+		cfg.WarmPoolWaitTimeout = 10 * time.Second
 	}
 	m := &Manager{
 		cfg:         cfg,
@@ -477,11 +485,11 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		return nil, fmt.Sprintf("at capacity (%d sessions)", m.cfg.MaxContainers)
 	}
 
-	deadline := time.Now().Add(60 * time.Second)
+	deadline := time.Now().Add(m.cfg.WarmPoolWaitTimeout)
 	for len(m.warmPool) == 0 {
 		if time.Now().After(deadline) {
 			m.mu.Unlock()
-			return nil, "no containers available (timed out after 60s)"
+			return nil, fmt.Sprintf("no containers available (timed out after %v)", m.cfg.WarmPoolWaitTimeout)
 		}
 		if isConnected != nil && !isConnected() {
 			m.mu.Unlock()
@@ -637,7 +645,7 @@ func (m *Manager) evictionLoop() {
 func (m *Manager) evictIdleSessions() {
 	type target struct {
 		accessToken string
-		c         *Container
+		c           *Container
 	}
 	now := time.Now()
 	var targets []target
