@@ -63,7 +63,7 @@ func main() {
 		MaxContainers:       envInt("MAX_CONTAINERS", 10),
 		PollInterval:        time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
 		ConfigRepo:          envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
-		ConfigTag:           envStr("CONFIG_TAG", "v0.0.8"),
+		ConfigTag:           envStr("CONFIG_TAG", "v0.0.9"),
 		DebugMode:           envBool("DEBUG_MODE", true),
 		VerifyAttestation:   envBool("VERIFY_ATTESTATION", false),
 		SkipJWTValidation:   envBool("SKIP_JWT_VALIDATION", true),
