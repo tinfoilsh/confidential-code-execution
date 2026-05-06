@@ -24,14 +24,14 @@ func newFakeIdentity(valid map[string]bool) *httptest.Server {
 			return
 		}
 		var body struct {
-			Token string `json:"token"`
+			APIKey string `json:"api_key"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "bad json", http.StatusBadRequest)
 			return
 		}
-		if !valid[body.Token] {
-			http.Error(w, "invalid token", http.StatusUnauthorized)
+		if !valid[body.APIKey] {
+			http.Error(w, "invalid api key", http.StatusUnauthorized)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

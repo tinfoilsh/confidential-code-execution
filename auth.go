@@ -47,7 +47,7 @@ func (m *Manager) AuthorizeSession(ctx context.Context, bearer string) error {
 //   - ErrAuthRequired    when controlplane returns 401 / 403
 //   - other err          on transport / unexpected status
 func (m *Manager) resolveIdentity(ctx context.Context, bearer string) error {
-	body, err := json.Marshal(map[string]string{"token": bearer})
+	body, err := json.Marshal(map[string]string{"api_key": bearer})
 	if err != nil {
 		return err
 	}
