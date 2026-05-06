@@ -1,36 +1,41 @@
 package main
 
-// Tests for the orchestrator's Clerk JWT gate. The validate-jwt round
-// trip is faked with a stub controlplane so we can exercise auth
-// without a live Clerk verifier.
+// Tests for the orchestrator's identity gate. The /api/shim/identity
+// round trip is faked with a stub controlplane so we can exercise auth
+// without a live api_keys DB.
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
 
-// newFakeValidateJWT stands in for controlplane's GET
-// /api/auth/validate-jwt. Returns 200 for any bearer in `valid`,
-// 401 otherwise.
-func newFakeValidateJWT(valid map[string]bool) *httptest.Server {
+// newFakeIdentity stands in for controlplane's POST /api/shim/identity.
+// 200 for any token in `valid`, 401 otherwise.
+func newFakeIdentity(valid map[string]bool) *httptest.Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/auth/validate-jwt", func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, "missing bearer", http.StatusUnauthorized)
+	mux.HandleFunc("/api/shim/identity", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		token := strings.TrimPrefix(auth, "Bearer ")
-		if !valid[token] {
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		if !valid[body.Token] {
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"user_id": "user_x"})
 	})
 	return httptest.NewServer(mux)
 }
@@ -44,7 +49,7 @@ func newAuthTestManager(t *testing.T, cpURL string) *Manager {
 }
 
 func TestAuthorizeSession_EmptyBearer(t *testing.T) {
-	cp := newFakeValidateJWT(nil)
+	cp := newFakeIdentity(nil)
 	defer cp.Close()
 	m := newAuthTestManager(t, cp.URL)
 
@@ -54,21 +59,21 @@ func TestAuthorizeSession_EmptyBearer(t *testing.T) {
 }
 
 func TestAuthorizeSession_ControlplaneRejects(t *testing.T) {
-	cp := newFakeValidateJWT(map[string]bool{}) // every token 401s
+	cp := newFakeIdentity(map[string]bool{}) // every token 401s
 	defer cp.Close()
 	m := newAuthTestManager(t, cp.URL)
 
-	if err := m.AuthorizeSession(context.Background(), "not-a-jwt"); !errors.Is(err, ErrAuthRequired) {
+	if err := m.AuthorizeSession(context.Background(), "tk_unknown"); !errors.Is(err, ErrAuthRequired) {
 		t.Fatalf("want ErrAuthRequired on 401 from controlplane, got %v", err)
 	}
 }
 
 func TestAuthorizeSession_ValidBearer(t *testing.T) {
-	cp := newFakeValidateJWT(map[string]bool{"jwt-A": true})
+	cp := newFakeIdentity(map[string]bool{"tk_known": true})
 	defer cp.Close()
 	m := newAuthTestManager(t, cp.URL)
 
-	if err := m.AuthorizeSession(context.Background(), "jwt-A"); err != nil {
+	if err := m.AuthorizeSession(context.Background(), "tk_known"); err != nil {
 		t.Fatalf("valid bearer should pass, got %v", err)
 	}
 }

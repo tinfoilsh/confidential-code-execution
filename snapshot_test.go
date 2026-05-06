@@ -245,6 +245,7 @@ func TestRestoreOnAssign(t *testing.T) {
 
 	// Webapp sends url-safe base64; orchestrator should normalize.
 	ctx := WithCodeExecutionEncryptionKey(context.Background(), keyURL)
+	ctx = WithBearer(ctx, "tk_test")
 
 	got, errMsg := m.GetOrAssign(ctx, "sess-1", nil)
 	if got == nil {
@@ -279,6 +280,7 @@ func TestRestoreOnAssignNoSnapshot(t *testing.T) {
 
 	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
 	ctx := WithCodeExecutionEncryptionKey(context.Background(), keyURL)
+	ctx = WithBearer(ctx, "tk_test")
 
 	if got, errMsg := m.GetOrAssign(ctx, "sess-fresh", nil); got == nil {
 		t.Fatalf("GetOrAssign failed: %s", errMsg)
@@ -301,6 +303,7 @@ func TestEvictAndSnapshot(t *testing.T) {
 	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
 	keyStd, _ := toStdBase64(keyURL)
 	c.CodeExecutionEncryptionKey = keyURL
+	c.Bearer = "tk_test"
 
 	bk := newFakeBuckets()
 	defer bk.Close()
@@ -331,6 +334,7 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	defer fc.Close()
 	c := fakeContainer(fc)
 	c.CodeExecutionEncryptionKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x22}, 32))
+	c.Bearer = "tk_test"
 
 	bk := newFakeBuckets()
 	bk.putFailuresRemaining = 1

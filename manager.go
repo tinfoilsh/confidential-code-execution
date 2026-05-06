@@ -56,6 +56,13 @@ type Container struct {
 	// The container itself never sees this value.
 	CodeExecutionEncryptionKey string
 
+	// Bearer is the api_key from the request's Authorization header, cached
+	// for use as the buckets bearer at restore-on-assign and eviction-time
+	// snapshot. Refreshed on every tools/call so a key rotation mid-session
+	// is picked up. Buckets resolves it to (user_id, org_id) for the
+	// storage prefix.
+	Bearer string
+
 	// LastActivity is updated on every successful proxied tool call.
 	// The eviction loop uses it to decide when to snapshot+destroy.
 	LastActivity time.Time
@@ -471,11 +478,15 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	defer sl.Unlock()
 
 	codeExecutionEncryptionKey := sessionCodeExecutionEncryptionKey(ctx)
+	bearer := sessionBearer(ctx)
 
 	m.mu.Lock()
 	if c, ok := m.sessions[accessToken]; ok {
 		if codeExecutionEncryptionKey != "" {
 			c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
+		}
+		if bearer != "" {
+			c.Bearer = bearer
 		}
 		m.mu.Unlock()
 		return c, ""
@@ -512,13 +523,16 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	if codeExecutionEncryptionKey != "" {
 		c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
 	}
+	if bearer != "" {
+		c.Bearer = bearer
+	}
 	m.mu.Unlock()
 
 	// Restore-on-assign. Failures here log and continue with an empty
 	// workspace — better than refusing to assign and breaking the user's
 	// chat entirely.
-	if codeExecutionEncryptionKey != "" {
-		if err := m.restoreInto(ctx, accessToken, c, codeExecutionEncryptionKey); err != nil {
+	if codeExecutionEncryptionKey != "" && bearer != "" {
+		if err := m.restoreInto(ctx, bearer, accessToken, c, codeExecutionEncryptionKey); err != nil {
 			log.Printf("orchestrator: restore failed for session %s on %s: %v (continuing with empty workspace)",
 				accessToken, c.Name, err)
 		} else {
@@ -542,8 +556,8 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 // the plaintext tar into the container's /restore. No-op when the
 // bucket has no entry, or when the supplied key can't open the entry —
 // both surface as a fresh empty workspace.
-func (m *Manager) restoreInto(ctx context.Context, accessToken string, c *Container, codeExecutionEncryptionKeyB64 string) error {
-	tarBytes, err := m.fetchSnapshotTar(ctx, accessToken, codeExecutionEncryptionKeyB64)
+func (m *Manager) restoreInto(ctx context.Context, bearer, accessToken string, c *Container, codeExecutionEncryptionKeyB64 string) error {
+	tarBytes, err := m.fetchSnapshotTar(ctx, bearer, accessToken, codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return fmt.Errorf("fetch snapshot: %w", err)
 	}
@@ -586,13 +600,19 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 }
 
 // evictAndSnapshot snapshots the container's workspace (if a Code
-// Execution Encryption Key was cached) and PUTs the plaintext tar to
-// buckets, which encrypts it under the cached key. Then deletes the
-// container. Called by the idle-eviction loop. Snapshot failures still
-// destroy the container — losing state is bad, but leaving stale
-// containers around is worse and the user can always start fresh.
+// Execution Encryption Key and bearer were cached) and PUTs the
+// plaintext tar to buckets, which encrypts it under the cached key.
+// Then deletes the container. Called by the idle-eviction loop.
+// Snapshot failures still destroy the container — losing state is
+// bad, but leaving stale containers around is worse and the user can
+// always start fresh.
 func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
-	if c.CodeExecutionEncryptionKey != "" {
+	switch {
+	case c.CodeExecutionEncryptionKey == "":
+		log.Printf("orchestrator: no code execution encryption key cached for session %s — skipping snapshot", accessToken)
+	case c.Bearer == "":
+		log.Printf("orchestrator: no api_key bearer cached for session %s — skipping snapshot", accessToken)
+	default:
 		ctx := context.Background()
 		tarBytes, err := m.fetchSnapshotFromContainer(c, accessToken)
 		if err != nil {
@@ -601,11 +621,11 @@ func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 			// One retry on transient PUT failure: a single buckets blip
 			// shouldn't cost a user their workspace. Beyond that we accept
 			// the loss and the user starts fresh on next chat open.
-			putErr := m.putSnapshotTar(ctx, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
+			putErr := m.putSnapshotTar(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			if putErr != nil {
 				log.Printf("orchestrator: PUT snapshot failed for session %s: %v — retrying once", accessToken, putErr)
 				time.Sleep(snapshotPutRetryDelay)
-				putErr = m.putSnapshotTar(ctx, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
+				putErr = m.putSnapshotTar(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			}
 			if putErr != nil {
 				log.Printf("orchestrator: PUT snapshot failed for session %s after retry: %v", accessToken, putErr)
@@ -613,8 +633,6 @@ func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 				log.Printf("orchestrator: snapshotted session %s (container %s) to buckets", accessToken, c.Name)
 			}
 		}
-	} else {
-		log.Printf("orchestrator: no code execution encryption key cached for session %s — skipping snapshot", accessToken)
 	}
 	c.Status = "deleting"
 	m.deleteContainer(c.ID)

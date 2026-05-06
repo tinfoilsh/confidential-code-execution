@@ -42,6 +42,7 @@ type ctxKey int
 
 const (
 	ctxKeyCodeExecutionEncryptionKey ctxKey = iota
+	ctxKeyBearer
 )
 
 // WithCodeExecutionEncryptionKey returns a child context carrying the
@@ -55,6 +56,21 @@ func WithCodeExecutionEncryptionKey(ctx context.Context, key string) context.Con
 
 func sessionCodeExecutionEncryptionKey(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeyCodeExecutionEncryptionKey).(string)
+	return v
+}
+
+// WithBearer returns a child context carrying the api_key bearer. Empty
+// values are not stored. Read by GetOrAssign and the eviction path so
+// buckets calls can authenticate and resolve the storage prefix.
+func WithBearer(ctx context.Context, bearer string) context.Context {
+	if bearer != "" {
+		ctx = context.WithValue(ctx, ctxKeyBearer, bearer)
+	}
+	return ctx
+}
+
+func sessionBearer(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyBearer).(string)
 	return v
 }
 
@@ -91,7 +107,10 @@ func toStdBase64(s string) (string, error) {
 // (404), or when the supplied key can't open the entry (403 — wrong
 // key or corrupt envelope). Both cases are non-fatal: GetOrAssign
 // proceeds with a fresh empty workspace.
-func (m *Manager) fetchSnapshotTar(ctx context.Context, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
+//
+// The bearer is the user's api_key — buckets resolves it to the owning
+// (user_id, org_id) and uses that as the R2 storage prefix.
+func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
 	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return nil, fmt.Errorf("decode code execution encryption key: %w", err)
@@ -100,6 +119,7 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, accessToken, codeExecuti
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("X-Encryption-Key", keyStd)
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
 
@@ -137,7 +157,10 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, accessToken, codeExecuti
 // putSnapshotTar PUTs the plaintext tar to buckets, encrypting under the
 // supplied Code Execution Encryption Key. Buckets generates a fresh DEK
 // per PUT (envelope v1) and wraps it under the supplied key.
-func (m *Manager) putSnapshotTar(ctx context.Context, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
+//
+// The bearer is the user's api_key — buckets resolves it to the owning
+// (user_id, org_id) and uses that as the R2 storage prefix.
+func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
 	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return fmt.Errorf("decode code execution encryption key: %w", err)
@@ -153,6 +176,7 @@ func (m *Manager) putSnapshotTar(ctx context.Context, accessToken, codeExecution
 	if err != nil {
 		return err
 	}
+	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
 
