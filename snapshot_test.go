@@ -66,12 +66,18 @@ func TestToStdBase64ConvertsURL(t *testing.T) {
 
 // fakeContainerServer stands in for a code-execution-environment
 // container. /restore records what plaintext tar arrives; /snapshot
-// returns a canned plaintext tar.
+// streams a canned plaintext tar with the success trailer; /health
+// returns whatever healthStatus is set to.
 type fakeContainerServer struct {
 	*httptest.Server
 	mu             sync.Mutex
 	gotRestoreTar  []byte
 	snapshotTarB64 string
+	// snapshotOmitTrailer mirrors a truncated stream: handler sends
+	// the JSON body but never sets X-Snapshot-Status=ok.
+	snapshotOmitTrailer bool
+	// healthStatus is the status code returned by /health. 0 means 200.
+	healthStatus int
 }
 
 func newFakeContainer(snapshotTar []byte) *fakeContainerServer {
@@ -100,7 +106,24 @@ func newFakeContainer(snapshotTar []byte) *fakeContainerServer {
 	})
 	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Trailer", snapshotTrailer)
+		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"tar": f.snapshotTarB64})
+		f.mu.Lock()
+		omit := f.snapshotOmitTrailer
+		f.mu.Unlock()
+		if !omit {
+			w.Header().Set(snapshotTrailer, "ok")
+		}
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		s := f.healthStatus
+		f.mu.Unlock()
+		if s == 0 {
+			s = http.StatusOK
+		}
+		w.WriteHeader(s)
 	})
 	f.Server = httptest.NewServer(mux)
 	return f
@@ -359,6 +382,67 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	}
 	if !stored {
 		t.Fatalf("blob not stored after retry")
+	}
+}
+
+func TestFetchSnapshotRejectsTruncatedStream(t *testing.T) {
+	// /snapshot returns 200 + body but no X-Snapshot-Status trailer —
+	// mirrors the executor hitting a walk error mid-tar. The orchestrator
+	// must refuse the result so we don't PUT a half-baked snapshot.
+	fc := newFakeContainer([]byte("partial-tar"))
+	fc.mu.Lock()
+	fc.snapshotOmitTrailer = true
+	fc.mu.Unlock()
+	defer fc.Close()
+	c := fakeContainer(fc)
+
+	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
+	_, err := m.fetchSnapshotFromContainer(c, "sess-truncated")
+	if err == nil {
+		t.Fatalf("expected error on missing snapshot trailer, got nil")
+	}
+	if !strings.Contains(err.Error(), "snapshot stream incomplete") {
+		t.Fatalf("expected stream-incomplete error, got: %v", err)
+	}
+}
+
+func TestGetOrAssignDiscardsUnhealthyWarmContainer(t *testing.T) {
+	// First warm container 503s on /health; orchestrator must drop it,
+	// pop the next one, and assign that.
+	bk := newFakeBuckets()
+	defer bk.Close()
+	prev := bucketsBase
+	bucketsBase = bk.URL
+	defer func() { bucketsBase = prev }()
+
+	bad := newFakeContainer(nil)
+	bad.mu.Lock()
+	bad.healthStatus = http.StatusServiceUnavailable
+	bad.mu.Unlock()
+	defer bad.Close()
+	good := newFakeContainer(nil)
+	defer good.Close()
+
+	cBad := fakeContainer(bad)
+	cBad.Name = "bad"
+	cGood := fakeContainer(good)
+	cGood.Name = "good"
+
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 2, MaxContainers: 4, IdleTimeout: time.Hour})
+	m.warmPool = []*Container{cBad, cGood}
+
+	got, errMsg := m.GetOrAssign(context.Background(), "sess-health", nil)
+	if got == nil {
+		t.Fatalf("GetOrAssign failed: %s", errMsg)
+	}
+	if got != cGood {
+		t.Fatalf("expected to assign healthy container %q, got %q", cGood.Name, got.Name)
+	}
+	m.mu.Lock()
+	left := len(m.warmPool)
+	m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("expected warm pool drained (1 discarded + 1 assigned), got %d left", left)
 	}
 }
 

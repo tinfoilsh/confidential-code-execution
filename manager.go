@@ -75,6 +75,12 @@ type Container struct {
 	// drift. recordContainerStatus tears it down at the threshold.
 	// Reset on any 2xx. Guarded by Manager.mu.
 	Consecutive403s int
+
+	// HealthFailures counts back-to-back /health failures observed by
+	// the periodic health checker. Reaching MaxHealthFailures evicts the
+	// container from the warm pool and destroys it.
+	// Reset on any 200. Guarded by m.mu.
+	HealthFailures int
 }
 
 type ManagerConfig struct {
@@ -102,6 +108,13 @@ type ManagerConfig struct {
 	// returns "no containers available" so the client gets a fast error
 	// instead of an indefinite spinner.
 	WarmPoolWaitTimeout time.Duration
+	// HealthCheckInterval is how often the background health checker
+	// scans every warm container's /health. Independent of the pool manager loop
+	HealthCheckInterval time.Duration
+	// MaxHealthFailures is the consecutive-failure threshold at which
+	// the health checker yanks a warm container from the pool and
+	// destroys it.
+	MaxHealthFailures int
 }
 
 type Manager struct {
@@ -130,6 +143,12 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 	if cfg.WarmPoolWaitTimeout == 0 {
 		cfg.WarmPoolWaitTimeout = 10 * time.Second
+	}
+	if cfg.HealthCheckInterval == 0 {
+		cfg.HealthCheckInterval = 15 * time.Second
+	}
+	if cfg.MaxHealthFailures == 0 {
+		cfg.MaxHealthFailures = 3
 	}
 	m := &Manager{
 		cfg:         cfg,
@@ -464,6 +483,11 @@ func (m *Manager) poolManagerLoop() {
 // sees the in-memory hit and shares the same container. This prevents
 // double-assignment and double-restore.
 //
+// Pre-assign /health: warm containers can die between the periodic
+// health pass and now (process crash, exec.sock disappearing, etc.).
+// We probe /health right after popping; a non-200 means we discard
+// the candidate and pop again.
+//
 // The user's Code Execution Encryption Key (read from ctx via
 // sessionCodeExecutionEncryptionKey) is cached on
 // c.CodeExecutionEncryptionKey so the eviction loop can PUT the snapshot
@@ -496,28 +520,43 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		m.mu.Unlock()
 		return nil, fmt.Sprintf("at capacity (%d sessions)", m.cfg.MaxContainers)
 	}
+	m.mu.Unlock()
 
 	deadline := time.Now().Add(m.cfg.WarmPoolWaitTimeout)
-	for len(m.warmPool) == 0 {
-		if time.Now().After(deadline) {
-			m.mu.Unlock()
-			return nil, fmt.Sprintf("no containers available (timed out after %v)", m.cfg.WarmPoolWaitTimeout)
+	var c *Container
+	for {
+		m.mu.Lock()
+		for len(m.warmPool) == 0 {
+			if time.Now().After(deadline) {
+				m.mu.Unlock()
+				return nil, fmt.Sprintf("no containers available (timed out after %v)", m.cfg.WarmPoolWaitTimeout)
+			}
+			if isConnected != nil && !isConnected() {
+				m.mu.Unlock()
+				log.Printf("orchestrator: client disconnected while waiting for session %s", accessToken)
+				return nil, "client disconnected"
+			}
+			// wait up to 2s at a time so we can re-check connection / deadline
+			go func() {
+				time.Sleep(2 * time.Second)
+				m.cond.Broadcast()
+			}()
+			m.cond.Wait()
 		}
-		if isConnected != nil && !isConnected() {
-			m.mu.Unlock()
-			log.Printf("orchestrator: client disconnected while waiting for session %s", accessToken)
-			return nil, "client disconnected"
+		candidate := m.warmPool[0]
+		m.warmPool = m.warmPool[1:]
+		m.mu.Unlock()
+
+		if m.checkContainerHealth(candidate) {
+			c = candidate
+			break
 		}
-		// wait up to 2s at a time so we can re-check connection / deadline
-		go func() {
-			time.Sleep(2 * time.Second)
-			m.cond.Broadcast()
-		}()
-		m.cond.Wait()
+		log.Printf("orchestrator: warm container %s failed pre-assign /health, discarding", candidate.Name)
+		candidate.Status = "failed"
+		go m.deleteContainer(candidate.ID)
 	}
 
-	c := m.warmPool[0]
-	m.warmPool = m.warmPool[1:]
+	m.mu.Lock()
 	c.Status = "assigning"
 	c.AssignedAt = time.Now()
 	c.LastActivity = time.Now()
@@ -691,6 +730,103 @@ func (m *Manager) evictIdleSessions() {
 		m.mu.Lock()
 		delete(m.assignLocks, t.accessToken)
 		m.mu.Unlock()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Health checking
+// ---------------------------------------------------------------------------
+
+func (m *Manager) checkContainerHealth(c *Container) bool {
+	if c.httpClient == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+c.Domain+"/health", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
+}
+
+// StartHealthCheckLoop launches the background goroutine that probes
+// every warm container's /health on a fixed cadence. Containers that
+// fail MaxHealthFailures consecutive checks are evicted + destroyed; the
+// pool manager replenishes on its next tick.
+func (m *Manager) StartHealthCheckLoop() {
+	go m.healthCheckLoop()
+}
+
+func (m *Manager) healthCheckLoop() {
+	for !m.shuttingDown {
+		time.Sleep(m.cfg.HealthCheckInterval)
+		if m.shuttingDown {
+			return
+		}
+		m.scanWarmHealth()
+	}
+}
+
+// scanWarmHealth probes /health on each warm container once. Successes
+// reset HealthFailures; failures bump it. A container that hits
+// MaxHealthFailures is removed from the warm pool and destroyed. We
+// snapshot the warm pool under m.mu, then run the (slow) network
+// probes lock-free. A container that's been pulled by GetOrAssign in
+// the meantime is no longer in m.warmPool when we go to evict, so the
+// final removal step is a no-op for it — that's fine, an in-flight
+// request will surface the failure on its own (proxy 502 or eviction).
+func (m *Manager) scanWarmHealth() {
+	m.mu.Lock()
+	targets := append([]*Container(nil), m.warmPool...)
+	m.mu.Unlock()
+
+	for _, c := range targets {
+		if m.checkContainerHealth(c) {
+			m.mu.Lock()
+			c.HealthFailures = 0
+			m.mu.Unlock()
+			continue
+		}
+		m.mu.Lock()
+		c.HealthFailures++
+		n := c.HealthFailures
+		m.mu.Unlock()
+		if n < m.cfg.MaxHealthFailures {
+			log.Printf("orchestrator: warm container %s /health failed (%d/%d)", c.Name, n, m.cfg.MaxHealthFailures)
+			continue
+		}
+
+		m.mu.Lock()
+		evicted := false
+		for i, x := range m.warmPool {
+			if x == c {
+				m.warmPool = append(m.warmPool[:i], m.warmPool[i+1:]...)
+				evicted = true
+				break
+			}
+		}
+		if evicted {
+			c.Status = "failed"
+			m.failed = append(m.failed, c)
+			m.failCount++
+			for len(m.failed) > 10 {
+				m.failed = m.failed[1:]
+			}
+		}
+		m.mu.Unlock()
+
+		if evicted {
+			log.Printf("orchestrator: warm container %s exceeded health failure threshold (%d) — destroying",
+				c.Name, m.cfg.MaxHealthFailures)
+			go m.deleteContainer(c.ID)
+		}
 	}
 }
 

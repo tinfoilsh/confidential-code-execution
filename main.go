@@ -68,6 +68,8 @@ func main() {
 		VerifyAttestation:   envBool("VERIFY_ATTESTATION", false),
 		SkipJWTValidation:   envBool("SKIP_JWT_VALIDATION", true),
 		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
+		HealthCheckInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 15)) * time.Second,
+		MaxHealthFailures:   envInt("MAX_HEALTH_FAILURES", 3),
 	}
 
 	// Snapshot storage lives at tinfoil-buckets. Default points at prod;
@@ -81,6 +83,7 @@ func main() {
 	mgr := NewManager(cfg)
 	mgr.StartPoolManager()
 	mgr.StartEvictionLoop()
+	mgr.StartHealthCheckLoop()
 
 	mux := http.NewServeMux()
 	srv := &http.Server{Addr: ":" + strconv.Itoa(port), Handler: mux}

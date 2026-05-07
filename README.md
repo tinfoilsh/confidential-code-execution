@@ -35,6 +35,8 @@ go build .
 | `DEBUG_MODE` | `true` | Pass `debug=true` to controlplane (enables SSH, modifies measurement) |
 | `VERIFY_ATTESTATION` | `false` | Verify enclave attestation + pin TLS public key. Requires `DEBUG_MODE=false`. |
 | `SKIP_JWT_VALIDATION` | `false` | Local dev only — accept `tools/call` without a Clerk JWT. Never set in prod. |
+| `HEALTH_CHECK_INTERVAL` | `15` | Seconds between `/health` probes of warm containers. |
+| `MAX_HEALTH_FAILURES` | `3` | Consecutive `/health` failures before a warm container is destroyed and replaced. |
 
 ### API
 

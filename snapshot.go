@@ -32,6 +32,9 @@ import (
 // bucketsBase is the tinfoil-buckets root. Override via env in main.go.
 var bucketsBase = "https://buckets.tinfoil.sh"
 
+// The HTTP trailer the environment sets to true once it's finished streaming
+const snapshotTrailer = "X-Snapshot-Status"
+
 // ctxKeyCodeExecutionEncryptionKey carries the user's symmetric Code
 // Execution Encryption Key down the call chain. The MCP boundary reads
 // X-Code-Execution-Encryption-Key from the request and stashes it here;
@@ -234,9 +237,12 @@ func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []b
 	return resp.StatusCode, nil
 }
 
-// fetchSnapshotFromContainer asks the running container for a plaintext
+// fetchSnapshotFromContainer asks the running container for a streaming plaintext
 // tar of /workspace. Used on eviction. Encryption is handled by buckets,
 // not the container, so the container response is just {tar: <base64>}.
+//
+// A clean stream is signaled by the X-Snapshot-Status: ok HTTP trailer.
+// A 200 with the trailer absent or != "ok" means there was a problem
 func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) ([]byte, error) {
 	if c.httpClient == nil {
 		return nil, fmt.Errorf("no http client for container %s", c.Name)
@@ -252,10 +258,17 @@ func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) (
 		return nil, fmt.Errorf("snapshot POST: %w", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, readErr := io.ReadAll(resp.Body)
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("snapshot returned %d: %s", resp.StatusCode, string(data))
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("read snapshot stream: %w", readErr)
+	}
+	// resp.Trailer is only populated after the body has been fully read.
+	if got := resp.Trailer.Get(snapshotTrailer); got != "ok" {
+		return nil, fmt.Errorf("snapshot stream incomplete: trailer %s=%q", snapshotTrailer, got)
 	}
 	var body struct {
 		Tar string `json:"tar"`
