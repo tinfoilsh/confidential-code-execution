@@ -16,31 +16,33 @@ go run .
 Or build a binary:
 
 ```bash
-go build -o orchestrator .
-./orchestrator
+go build .
+./confidential-code-execution
 ```
 
 ### Environment variables
 
-| Variable             | Default                                | Notes                                                                         |
-| -------------------- | -------------------------------------- | ----------------------------------------------------------------------------- |
-| `ADMIN_API_KEY`      | _(required)_                           | Tinfoil controlplane bearer token                                             |
-| `POOL_SIZE`          | `3`                                    | Target warm pool size                                                         |
-| `MAX_CONTAINERS`     | `10`                                   | Hard cap on concurrent containers                                             |
-| `PORT`               | `7070`                                 | Orchestrator listen port                                                      |
-| `POLL_INTERVAL`      | `2`                                    | Seconds between controlplane polls                                            |
-| `CONFIG_REPO`        | `tinfoilsh/code-execution-environment` | Image repo                                                                    |
-| `CONFIG_TAG`         | `v0.0.6`                               | Image tag                                                                     |
-| `DEBUG_MODE`         | `true`                                 | Pass `debug=true` to controlplane (enables SSH, modifies measurement)         |
-| `VERIFY_ATTESTATION` | `false`                                | Verify enclave attestation + pin TLS public key. Requires `DEBUG_MODE=false`. |
+| Variable         | Default                                | Notes                              |
+| ---------------- | -------------------------------------- | ---------------------------------- |
+| `ADMIN_API_KEY`  | _(required)_                           | Tinfoil controlplane bearer token  |
+| `POOL_SIZE`      | `3`                                    | Target warm pool size              |
+| `MAX_CONTAINERS` | `10`                                   | Hard cap on concurrent containers  |
+| `PORT`           | `7070`                                 | Orchestrator listen port           |
+| `POLL_INTERVAL`  | `2`                                    | Seconds between controlplane polls |
+| `CONFIG_REPO`    | `tinfoilsh/code-execution-environment` | Image repo                         |
+
+|  
+| `DEBUG_MODE` | `true` | Pass `debug=true` to controlplane (enables SSH, modifies measurement) |
+| `VERIFY_ATTESTATION` | `false` | Verify enclave attestation + pin TLS public key. Requires `DEBUG_MODE=false`. |
+| `SKIP_JWT_VALIDATION` | `false` | Local dev only — accept `tools/call` without a Clerk JWT. Never set in prod. |
 
 ### API
 
-All tool access is through the single MCP endpoint. The session ID comes from the `X-Session-Id` header.
+All tool access is through the single MCP endpoint. The session is identified by the per-chat secret in the `X-Code-Execution-Access-Token` header.
 
 ```
 POST /mcp
-Headers: X-Session-Id: <id>
+Headers: X-Code-Execution-Access-Token: <token>
 Body: JSON-RPC 2.0
 
 Methods:
@@ -56,7 +58,7 @@ Admin endpoints:
 ```
 GET  /health        — pool counts
 GET  /metrics       — full container details (used by viz.py)
-POST /cleanup       {"sessionId": "abc"}  — release a single session
+POST /cleanup       {"codeExecutionAccessToken": "abc"}  — release a single session
 POST /delete-all    — delete all tracked containers (with name verification)
 POST /finish        — delete all containers and shut down the server
 ```

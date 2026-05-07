@@ -58,23 +58,29 @@ func main() {
 	}
 
 	cfg := ManagerConfig{
-		AdminAPIKey:       adminAPIKey,
-		PoolSize:          envInt("POOL_SIZE", 3),
-		MaxContainers:     envInt("MAX_CONTAINERS", 10),
-		PollInterval:      time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
-		ConfigRepo:        envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
-		ConfigTag:         envStr("CONFIG_TAG", "v0.0.7"),
-		DebugMode:         envBool("DEBUG_MODE", true),
-		VerifyAttestation: envBool("VERIFY_ATTESTATION", false),
+		AdminAPIKey:         adminAPIKey,
+		PoolSize:            envInt("POOL_SIZE", 3),
+		MaxContainers:       envInt("MAX_CONTAINERS", 10),
+		PollInterval:        time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
+		ConfigRepo:          envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
+		ConfigTag:           envStr("CONFIG_TAG", "v0.0.9"),
+		DebugMode:           envBool("DEBUG_MODE", true),
+		VerifyAttestation:   envBool("VERIFY_ATTESTATION", false),
+		SkipJWTValidation:   envBool("SKIP_JWT_VALIDATION", true),
+		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
 	}
+
+	// Snapshot storage lives at tinfoil-buckets. Default points at prod;
+	// override for local dev or staging via BUCKETS_BASE.
+	bucketsBase = envStr("BUCKETS_BASE", bucketsBase)
 	port := envInt("PORT", 7070)
 
 	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v debug=%v verify_attestation=%v",
 		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.DebugMode, cfg.VerifyAttestation)
 	log.Printf("orchestrator: repo=%s tag=%s", cfg.ConfigRepo, cfg.ConfigTag)
-
 	mgr := NewManager(cfg)
 	mgr.StartPoolManager()
+	mgr.StartEvictionLoop()
 
 	mux := http.NewServeMux()
 	srv := &http.Server{Addr: ":" + strconv.Itoa(port), Handler: mux}
@@ -87,16 +93,16 @@ func main() {
 	})
 	mux.HandleFunc("/cleanup", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			SessionID string `json:"sessionId"`
+			AccessToken string `json:"codeExecutionAccessToken"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		if body.SessionID == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sessionId is required"})
+		if body.AccessToken == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "codeExecutionAccessToken is required"})
 			return
 		}
-		c := mgr.CleanupSession(body.SessionID)
+		c := mgr.CleanupSession(body.AccessToken)
 		if c == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no session found for " + body.SessionID})
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no session found for " + body.AccessToken})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "cleaned up", "container": c.Name})
@@ -119,7 +125,7 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 			return
 		}
-		status, resp := HandleMCPRequest(mgr, r.Header, req)
+		status, resp := HandleMCPRequest(r.Context(), mgr, r.Header, req)
 		if resp == nil {
 			w.WriteHeader(status)
 			return

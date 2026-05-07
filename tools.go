@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,9 @@ type ToolSchema struct {
 }
 
 // ToolHandler executes a tool call and returns a text result for MCP.
-type ToolHandler func(m *Manager, sessionID string, args map[string]any) (string, error)
+// ctx carries per-request attrs (pubkey, resume DEK) read from headers
+// at the MCP boundary; downstream calls thread it to GetOrAssign.
+type ToolHandler func(ctx context.Context, m *Manager, accessToken string, args map[string]any) (string, error)
 
 var Tools = []ToolSchema{
 	{
@@ -142,12 +145,12 @@ func argInt(args map[string]any, key string) (int, error) {
 	return 0, fmt.Errorf("argument %s must be an integer", key)
 }
 
-func handleBash(m *Manager, sessionID string, args map[string]any) (string, error) {
+func handleBash(ctx context.Context, m *Manager, accessToken string, args map[string]any) (string, error) {
 	cmd, err := argString(args, "command")
 	if err != nil {
 		return "", err
 	}
-	resp := m.ExecCommand(sessionID, cmd)
+	resp := m.ExecCommand(ctx, accessToken, cmd)
 	if e, ok := resp["error"].(string); ok && e != "" {
 		return "", fmt.Errorf("%s", e)
 	}
@@ -169,12 +172,12 @@ func handleBash(m *Manager, sessionID string, args map[string]any) (string, erro
 // optional view_range argument. Returns the file's lines plus the
 // 1-indexed [start, end] window the caller should display. When
 // view_range is omitted the window covers the whole file.
-func readFileLineRange(m *Manager, sessionID string, args map[string]any) (path string, lines []string, start, end int, err error) {
+func readFileLineRange(ctx context.Context, m *Manager, accessToken string, args map[string]any) (path string, lines []string, start, end int, err error) {
 	path, err = argString(args, "path")
 	if err != nil {
 		return "", nil, 0, 0, err
 	}
-	content, err := m.ReadFile(sessionID, path)
+	content, err := m.ReadFile(ctx, accessToken, path)
 	if err != nil {
 		return "", nil, 0, 0, err
 	}
@@ -200,8 +203,8 @@ func readFileLineRange(m *Manager, sessionID string, args map[string]any) (path 
 	return path, lines, start, end, nil
 }
 
-func handleView(m *Manager, sessionID string, args map[string]any) (string, error) {
-	_, lines, start, end, err := readFileLineRange(m, sessionID, args)
+func handleView(ctx context.Context, m *Manager, accessToken string, args map[string]any) (string, error) {
+	_, lines, start, end, err := readFileLineRange(ctx, m, accessToken, args)
 	if err != nil {
 		return "", err
 	}
@@ -297,8 +300,8 @@ func inferLanguage(path string) string {
 // block with language inferred from extension. The router emits this
 // output as inline assistant content so the user sees the file rendered
 // directly in the chat alongside the model's tool result.
-func handlePresent(m *Manager, sessionID string, args map[string]any) (string, error) {
-	path, lines, start, end, err := readFileLineRange(m, sessionID, args)
+func handlePresent(ctx context.Context, m *Manager, accessToken string, args map[string]any) (string, error) {
+	path, lines, start, end, err := readFileLineRange(ctx, m, accessToken, args)
 	if err != nil {
 		return "", err
 	}
@@ -331,7 +334,7 @@ func longestFence(body string) string {
 	return strings.Repeat("`", n)
 }
 
-func handleStrReplace(m *Manager, sessionID string, args map[string]any) (string, error) {
+func handleStrReplace(ctx context.Context, m *Manager, accessToken string, args map[string]any) (string, error) {
 	path, err := argString(args, "path")
 	if err != nil {
 		return "", err
@@ -344,7 +347,7 @@ func handleStrReplace(m *Manager, sessionID string, args map[string]any) (string
 	if err != nil {
 		return "", err
 	}
-	content, err := m.ReadFile(sessionID, path)
+	content, err := m.ReadFile(ctx, accessToken, path)
 	if err != nil {
 		return "", err
 	}
@@ -356,14 +359,14 @@ func handleStrReplace(m *Manager, sessionID string, args map[string]any) (string
 		return "", fmt.Errorf("old_str appears %d times in %s — must be unique", count, path)
 	}
 	updated := strings.Replace(content, oldStr, newStr, 1)
-	resp := m.WriteFile(sessionID, path, updated)
+	resp := m.WriteFile(ctx, accessToken, path, updated)
 	if e, ok := resp["error"].(string); ok && e != "" {
 		return "", fmt.Errorf("%s", e)
 	}
 	return fmt.Sprintf("Replaced 1 occurrence in %s", path), nil
 }
 
-func handleCreate(m *Manager, sessionID string, args map[string]any) (string, error) {
+func handleCreate(ctx context.Context, m *Manager, accessToken string, args map[string]any) (string, error) {
 	path, err := argString(args, "path")
 	if err != nil {
 		return "", err
@@ -372,17 +375,17 @@ func handleCreate(m *Manager, sessionID string, args map[string]any) (string, er
 	if err != nil {
 		return "", err
 	}
-	if m.FileExists(sessionID, path) {
+	if m.FileExists(ctx, accessToken, path) {
 		return "", fmt.Errorf("file already exists: %s", path)
 	}
-	resp := m.WriteFile(sessionID, path, text)
+	resp := m.WriteFile(ctx, accessToken, path, text)
 	if e, ok := resp["error"].(string); ok && e != "" {
 		return "", fmt.Errorf("%s", e)
 	}
 	return fmt.Sprintf("Created %s", path), nil
 }
 
-func handleInsert(m *Manager, sessionID string, args map[string]any) (string, error) {
+func handleInsert(ctx context.Context, m *Manager, accessToken string, args map[string]any) (string, error) {
 	path, err := argString(args, "path")
 	if err != nil {
 		return "", err
@@ -395,7 +398,7 @@ func handleInsert(m *Manager, sessionID string, args map[string]any) (string, er
 	if err != nil {
 		return "", err
 	}
-	content, err := m.ReadFile(sessionID, path)
+	content, err := m.ReadFile(ctx, accessToken, path)
 	if err != nil {
 		return "", err
 	}
@@ -406,7 +409,7 @@ func handleInsert(m *Manager, sessionID string, args map[string]any) (string, er
 	out := append([]string{}, lines[:lineNum]...)
 	out = append(out, text)
 	out = append(out, lines[lineNum:]...)
-	resp := m.WriteFile(sessionID, path, strings.Join(out, "\n"))
+	resp := m.WriteFile(ctx, accessToken, path, strings.Join(out, "\n"))
 	if e, ok := resp["error"].(string); ok && e != "" {
 		return "", fmt.Errorf("%s", e)
 	}

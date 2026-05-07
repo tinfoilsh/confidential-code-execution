@@ -28,7 +28,7 @@ MAX_TURNS = 10
 # ---------------------------------------------------------------------------
 # MCP client helpers
 # ---------------------------------------------------------------------------
-def _mcp_request(method: str, params: dict | None = None, session_id: str = "") -> dict:
+def _mcp_request(method: str, params: dict | None = None, access_token: str = "") -> dict:
     """Send a JSON-RPC request to the MCP endpoint and return the result."""
     body = {
         "jsonrpc": "2.0",
@@ -39,8 +39,8 @@ def _mcp_request(method: str, params: dict | None = None, session_id: str = "") 
         body["params"] = params
 
     headers = {"Content-Type": "application/json"}
-    if session_id:
-        headers["X-Session-Id"] = session_id
+    if access_token:
+        headers["X-Code-Execution-Access-Token"] = access_token
 
     req = urllib.request.Request(
         MCP_URL,
@@ -75,12 +75,12 @@ def _list_tools() -> list[ChatCompletionToolParam]:
     return openai_tools
 
 
-def _call_tool(name: str, args: dict, session_id: str) -> str:
+def _call_tool(name: str, args: dict, access_token: str) -> str:
     """Call a tool via MCP and return the text content."""
     result = _mcp_request(
         "tools/call",
         {"name": name, "arguments": args},
-        session_id=session_id,
+        access_token=access_token,
     )
     # Extract text from MCP content array
     content_parts = result.get("content", [])
@@ -110,7 +110,7 @@ def log(lines: list[str], msg: str) -> None:
 
 
 def run_agent(user_message: str) -> str:
-    session_id = uuid.uuid4().hex[:12]
+    access_token = uuid.uuid4().hex[:12]
 
     lines: list[str] = []
     tools = _list_tools()
@@ -123,7 +123,7 @@ def run_agent(user_message: str) -> str:
     log(lines, "=" * 60)
     log(lines, f"User: {user_message}")
     log(lines, f"Model: {MODEL}")
-    log(lines, f"Session: {session_id}")
+    log(lines, f"Access token: {access_token}")
     log(lines, f"MCP endpoint: {MCP_URL}")
     log(lines, "=" * 60)
 
@@ -178,7 +178,7 @@ def run_agent(user_message: str) -> str:
             args = json.loads(tool_call.function.arguments)
             log(lines, f"\n[exec] {tool_call.function.name}({json.dumps(args)})")
 
-            result = _call_tool(tool_call.function.name, args, session_id)
+            result = _call_tool(tool_call.function.name, args, access_token)
             log(lines, f"[result]\n{result}")
 
             messages.append(
