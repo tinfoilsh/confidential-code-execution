@@ -131,7 +131,7 @@ func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEnc
 // pushRestore POSTs the plaintext tar to the container's /restore.
 // Must run before any user traffic touches the container. A 403 counts
 // toward the consecutive-403s threshold via recordContainerStatus.
-func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []byte) (int, error) {
+func (m *Manager) pushRestore(ctx context.Context, c *Container, accessToken string, plaintextTar []byte) (int, error) {
 	if c.httpClient == nil {
 		return 0, fmt.Errorf("no http client for container %s", c.Name)
 	}
@@ -141,7 +141,7 @@ func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []b
 	if err != nil {
 		return 0, err
 	}
-	req, err := http.NewRequest("POST", "https://"+c.Domain+"/restore", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+c.Domain+"/restore", bytes.NewReader(body))
 	if err != nil {
 		return 0, err
 	}

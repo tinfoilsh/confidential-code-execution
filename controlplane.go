@@ -162,6 +162,29 @@ func (cp *Controlplane) validateKey(ctx context.Context, apiKey string) (int, er
 
 var ErrAuthRequired = errors.New("code execution requires a valid api key")
 
+// Bounds how long a positive validate-key response is reused.
+const authCacheTTL = 30 * time.Second
+
+func (m *Manager) authCacheCheck(bearer string) bool {
+	m.authCacheMu.Lock()
+	defer m.authCacheMu.Unlock()
+	exp, ok := m.authCache[bearer]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(m.authCache, bearer)
+		return false
+	}
+	return true
+}
+
+func (m *Manager) authCacheStore(bearer string) {
+	m.authCacheMu.Lock()
+	defer m.authCacheMu.Unlock()
+	m.authCache[bearer] = time.Now().Add(authCacheTTL)
+}
+
 // AuthorizeSession verifies the bearer is a valid api_key.
 //
 //   - nil               on a valid api_key (200)
@@ -174,12 +197,16 @@ func (m *Manager) AuthorizeSession(ctx context.Context, bearer string) error {
 	if bearer == "" {
 		return ErrAuthRequired
 	}
+	if m.authCacheCheck(bearer) {
+		return nil
+	}
 	status, err := m.cp.validateKey(ctx, bearer)
 	if err != nil {
 		return err
 	}
 	switch status {
 	case http.StatusOK:
+		m.authCacheStore(bearer)
 		return nil
 	// common controlplane rejections — 401, 402, 403, 429
 	case http.StatusUnauthorized,

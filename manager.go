@@ -79,7 +79,11 @@ type Manager struct {
 	inflight    []*Container
 	sessions    map[string]*Container
 	assignLocks map[string]*sync.Mutex // see lockSession
-	done        chan struct{}          // closed by Finish to signal shutdown
+	finishOnce  sync.Once
+	done        chan struct{} // closed by Finish to signal shutdown
+
+	authCacheMu sync.Mutex
+	authCache   map[string]time.Time // bearer → expiry; positive validations only
 
 	cp      *Controlplane
 	buckets *Buckets
@@ -117,6 +121,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		sessions:    map[string]*Container{},
 		assignLocks: map[string]*sync.Mutex{},
 		done:        make(chan struct{}),
+		authCache:   map[string]time.Time{},
 	}
 	m.cond = sync.NewCond(&m.mu)
 	return m
@@ -320,11 +325,25 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	sl.Lock()
 	defer sl.Unlock()
 
+	// If we never end up registering a session, drop the assignLocks so it doesn't grow the map
+	assigned := false
+	defer func() {
+		if assigned {
+			return
+		}
+		m.mu.Lock()
+		if _, ok := m.sessions[accessToken]; !ok {
+			delete(m.assignLocks, accessToken)
+		}
+		m.mu.Unlock()
+	}()
+
 	// Re-check after acquiring sl: another goroutine may have assigned
 	// while we were waiting.
 	m.mu.Lock()
 	if c, ok := m.sessions[accessToken]; ok {
 		m.mu.Unlock()
+		assigned = true
 		return c, ""
 	}
 	m.mu.Unlock()
@@ -392,6 +411,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	m.mu.Lock()
 	m.sessions[accessToken] = c
 	m.mu.Unlock()
+	assigned = true
 
 	return c, ""
 }
@@ -411,10 +431,10 @@ func (m *Manager) restoreInto(ctx context.Context, bearer, accessToken string, c
 	}
 	// One retry on transient (5xx, network). 4xx (incl. 403 token
 	// mismatch, 410 window closed) won't recover — bail.
-	status, err := m.pushRestore(c, accessToken, tarBytes)
+	status, err := m.pushRestore(ctx, c, accessToken, tarBytes)
 	if err != nil && (status == 0 || status >= 500) {
 		time.Sleep(restorePushRetryDelay)
-		_, err = m.pushRestore(c, accessToken, tarBytes)
+		_, err = m.pushRestore(ctx, c, accessToken, tarBytes)
 	}
 	if err != nil {
 		restores.WithLabelValues("failure").Inc()
@@ -486,7 +506,14 @@ func (m *Manager) evictionLoop() {
 		case <-m.done:
 			return
 		case <-time.After(m.cfg.EvictionPoll):
-			m.evictIdleSessions()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("orchestrator: eviction loop error: %v", r)
+					}
+				}()
+				m.evictIdleSessions()
+			}()
 		}
 	}
 }
@@ -515,11 +542,15 @@ func (m *Manager) evictIdleSessions() {
 	}
 	m.mu.Unlock()
 
+	// Fan out one goroutine per session — a hung executor on session A
+	// can't delay session B's snapshot. Mirrors scanSessionHealth.
 	for _, t := range targets {
-		m.evictAndSnapshot(context.Background(), t.accessToken, t.c)
-		m.mu.Lock()
-		delete(m.assignLocks, t.accessToken)
-		m.mu.Unlock()
+		go func(accessToken string, c *Container) {
+			m.evictAndSnapshot(context.Background(), accessToken, c)
+			m.mu.Lock()
+			delete(m.assignLocks, accessToken)
+			m.mu.Unlock()
+		}(t.accessToken, t.c)
 	}
 }
 
@@ -556,8 +587,15 @@ func (m *Manager) healthCheckLoop() {
 		case <-m.done:
 			return
 		case <-time.After(m.cfg.HealthCheckInterval):
-			m.scanWarmHealth()
-			m.scanSessionHealth()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("orchestrator: health check loop error: %v", r)
+					}
+				}()
+				m.scanWarmHealth()
+				m.scanSessionHealth()
+			}()
 		}
 	}
 }
@@ -677,45 +715,47 @@ func (m *Manager) CleanupAll() {
 // snapshot doesn't finish within ShutdownDeadline fall through to
 // CleanupAll's plain delete — their state is lost.
 func (m *Manager) Finish() {
-	close(m.done)
-	// Wake any GetOrAssign waiters parked on cond so they exit promptly.
-	m.mu.Lock()
-	m.cond.Broadcast()
-	m.mu.Unlock()
+	m.finishOnce.Do(func() {
+		close(m.done)
+		// Wake any GetOrAssign waiters parked on cond so they exit promptly.
+		m.mu.Lock()
+		m.cond.Broadcast()
+		m.mu.Unlock()
 
-	type target struct {
-		accessToken string
-		c           *Container
-	}
-	var targets []target
-	m.mu.Lock()
-	for sid, c := range m.sessions {
-		targets = append(targets, target{sid, c})
-	}
-	// Drop session entries up front so CleanupAll doesn't double-delete
-	// the container we're about to evictAndSnapshot.
-	m.sessions = map[string]*Container{}
-	m.mu.Unlock()
-
-	if len(targets) > 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), m.cfg.ShutdownDeadline)
-		defer cancel()
-		var wg sync.WaitGroup
-		for _, t := range targets {
-			wg.Add(1)
-			go func(t target) {
-				defer wg.Done()
-				m.evictAndSnapshot(ctx, t.accessToken, t.c)
-			}(t)
+		type target struct {
+			accessToken string
+			c           *Container
 		}
-		done := make(chan struct{})
-		go func() { wg.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-ctx.Done():
-			log.Printf("orchestrator: shutdown deadline (%v) hit, %d session snapshot(s) may have been lost", m.cfg.ShutdownDeadline, len(targets))
+		var targets []target
+		m.mu.Lock()
+		for sid, c := range m.sessions {
+			targets = append(targets, target{sid, c})
 		}
-	}
+		// Drop session entries up front so CleanupAll doesn't double-delete
+		// the container we're about to evictAndSnapshot.
+		m.sessions = map[string]*Container{}
+		m.mu.Unlock()
 
-	m.CleanupAll()
+		if len(targets) > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), m.cfg.ShutdownDeadline)
+			defer cancel()
+			var wg sync.WaitGroup
+			for _, t := range targets {
+				wg.Add(1)
+				go func(t target) {
+					defer wg.Done()
+					m.evictAndSnapshot(ctx, t.accessToken, t.c)
+				}(t)
+			}
+			done := make(chan struct{})
+			go func() { wg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				log.Printf("orchestrator: shutdown deadline (%v) hit, %d session snapshot(s) may have been lost", m.cfg.ShutdownDeadline, len(targets))
+			}
+		}
+
+		m.CleanupAll()
+	})
 }
