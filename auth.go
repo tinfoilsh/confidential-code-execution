@@ -29,7 +29,7 @@ func (m *Manager) AuthorizeSession(ctx context.Context, bearer string) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", apiBase+"/api/shim/validate-key", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "POST", m.cfg.ControlPlaneURL+"/api/shim/validate-key", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

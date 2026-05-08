@@ -46,10 +46,11 @@ func newFakeValidateKey(valid map[string]bool, rejectStatus int) *httptest.Serve
 
 func newAuthTestManager(t *testing.T, cpURL string) *Manager {
 	t.Helper()
-	prev := apiBase
-	apiBase = cpURL
-	t.Cleanup(func() { apiBase = prev })
-	return NewManager(ManagerConfig{AdminAPIKey: "x", IdleTimeout: time.Hour})
+	return NewManager(ManagerConfig{
+		AdminAPIKey:     "x",
+		ControlPlaneURL: cpURL,
+		IdleTimeout:     time.Hour,
+	})
 }
 
 func TestAuthorizeSession_EmptyBearer(t *testing.T) {

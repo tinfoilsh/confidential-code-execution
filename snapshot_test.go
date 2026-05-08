@@ -246,10 +246,6 @@ func TestRestoreOnAssign(t *testing.T) {
 
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	// Pre-load the bucket with a snapshot for sess-1, encrypted under
 	// the user's key. (fake bucket stores std-base64 of the key.)
 	keyRaw := bytes.Repeat([]byte{0xab}, 32)
@@ -263,7 +259,7 @@ func TestRestoreOnAssign(t *testing.T) {
 	defer fc.Close()
 	c := fakeContainer(fc)
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 1, MaxContainers: 4, IdleTimeout: time.Hour})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, PoolSize: 1, MaxContainers: 4, IdleTimeout: time.Hour})
 	m.warmPool = []*Container{c}
 
 	// Webapp sends url-safe base64; orchestrator should normalize.
@@ -290,15 +286,11 @@ func TestRestoreOnAssignNoSnapshot(t *testing.T) {
 	// No snapshot in buckets → 404 → fresh container, /restore not called.
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	fc := newFakeContainer(nil)
 	defer fc.Close()
 	c := fakeContainer(fc)
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 1, MaxContainers: 4, IdleTimeout: time.Hour})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, PoolSize: 1, MaxContainers: 4, IdleTimeout: time.Hour})
 	m.warmPool = []*Container{c}
 
 	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
@@ -330,11 +322,7 @@ func TestEvictAndSnapshot(t *testing.T) {
 
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
-	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL})
 	m.evictAndSnapshot("sess-evict", c)
 
 	bk.mu.Lock()
@@ -362,15 +350,11 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	bk := newFakeBuckets()
 	bk.putFailuresRemaining = 1
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	prevDelay := snapshotPutRetryDelay
 	snapshotPutRetryDelay = 0
 	defer func() { snapshotPutRetryDelay = prevDelay }()
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL})
 	m.evictAndSnapshot("sess-retry", c)
 
 	bk.mu.Lock()
@@ -398,11 +382,7 @@ func TestFinishSnapshotsActiveSessions(t *testing.T) {
 
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
-	m := NewManager(ManagerConfig{AdminAPIKey: "x", ShutdownDeadline: 5 * time.Second})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, ShutdownDeadline: 5 * time.Second})
 	m.sessions["sess-shutdown"] = c
 
 	m.Finish()
@@ -451,10 +431,6 @@ func TestGetOrAssignDiscardsUnhealthyWarmContainer(t *testing.T) {
 	// pop the next one, and assign that.
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	bad := newFakeContainer(nil)
 	bad.mu.Lock()
 	bad.healthStatus = http.StatusServiceUnavailable
@@ -468,7 +444,7 @@ func TestGetOrAssignDiscardsUnhealthyWarmContainer(t *testing.T) {
 	cGood := fakeContainer(good)
 	cGood.Name = "good"
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 2, MaxContainers: 4, IdleTimeout: time.Hour})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, PoolSize: 2, MaxContainers: 4, IdleTimeout: time.Hour})
 	m.warmPool = []*Container{cBad, cGood}
 
 	got, errMsg := m.GetOrAssign(context.Background(), "sess-health", nil)
@@ -492,10 +468,6 @@ func TestPerSessionSerialization(t *testing.T) {
 	// see the same container.
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	fc := newFakeContainer(nil)
 	defer fc.Close()
 	c1 := fakeContainer(fc)
@@ -503,7 +475,7 @@ func TestPerSessionSerialization(t *testing.T) {
 	c2 := fakeContainer(fc)
 	c2.Name = "second"
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 2, MaxContainers: 8, IdleTimeout: time.Hour})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, PoolSize: 2, MaxContainers: 8, IdleTimeout: time.Hour})
 	m.warmPool = []*Container{c1, c2}
 
 	var wg sync.WaitGroup

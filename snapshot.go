@@ -29,9 +29,6 @@ import (
 	"net/http"
 )
 
-// bucketsBase is the tinfoil-buckets root. Override via env in main.go.
-var bucketsBase = "https://buckets.tinfoil.sh"
-
 // The HTTP trailer the environment sets to true once it's finished streaming
 const snapshotTrailer = "X-Snapshot-Status"
 
@@ -118,7 +115,7 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, cod
 	if err != nil {
 		return nil, fmt.Errorf("decode code execution encryption key: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", bucketsBase+"/items/"+accessToken, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", m.cfg.BucketsBase+"/items/"+accessToken, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +172,7 @@ func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeE
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "PUT", bucketsBase+"/items/"+accessToken, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "PUT", m.cfg.BucketsBase+"/items/"+accessToken, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

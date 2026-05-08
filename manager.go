@@ -17,10 +17,6 @@ import (
 	"github.com/tinfoilsh/verifier/client"
 )
 
-// apiBase is the controlplane root for /api/* calls. Overridable via
-// CONTROL_PLANE_URL env var
-var apiBase = envStr("CONTROL_PLANE_URL", "https://api.tinfoil.sh")
-
 // snapshotPutRetryDelay is how long evictAndSnapshot waits between
 // the first and second attempt to PUT a snapshot tar to buckets.
 // Variable so tests can shrink it.
@@ -83,7 +79,13 @@ type Container struct {
 }
 
 type ManagerConfig struct {
-	AdminAPIKey     string
+	AdminAPIKey string
+	// ControlPlaneURL is the controlplane root for /api/* calls.
+	// Overridable via CONTROL_PLANE_URL env var.
+	ControlPlaneURL string
+	// BucketsBase is the tinfoil-buckets root for snapshot storage.
+	// Overridable via BUCKETS_BASE env var.
+	BucketsBase     string
 	PoolSize        int
 	MaxContainers   int
 	PollInterval    time.Duration
@@ -136,6 +138,12 @@ type Manager struct {
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
+	if cfg.ControlPlaneURL == "" {
+		cfg.ControlPlaneURL = "https://api.tinfoil.sh"
+	}
+	if cfg.BucketsBase == "" {
+		cfg.BucketsBase = "https://buckets.tinfoil.sh"
+	}
 	if cfg.IdleTimeout == 0 {
 		cfg.IdleTimeout = 1 * time.Minute
 	}
@@ -205,7 +213,7 @@ func (m *Manager) apiRequestWithHeaders(method, path string, body any, extra map
 		}
 		buf = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, apiBase+path, buf)
+	req, err := http.NewRequest(method, m.cfg.ControlPlaneURL+path, buf)
 	if err != nil {
 		return 0, nil, err
 	}

@@ -58,6 +58,8 @@ func main() {
 
 	cfg := ManagerConfig{
 		AdminAPIKey:         adminAPIKey,
+		ControlPlaneURL:     envStr("CONTROL_PLANE_URL", ""),
+		BucketsBase:         envStr("BUCKETS_BASE", ""),
 		PoolSize:            envInt("POOL_SIZE", 3),
 		MaxContainers:       envInt("MAX_CONTAINERS", 10),
 		PollInterval:        time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
@@ -73,9 +75,6 @@ func main() {
 		DevBypassAuth:      envBool("DEV_BYPASS_AUTH", false),
 	}
 
-	// Snapshot storage lives at tinfoil-buckets. Default points at prod;
-	// override for local dev or staging via BUCKETS_BASE.
-	bucketsBase = envStr("BUCKETS_BASE", bucketsBase)
 	port := envInt("PORT", 7070)
 
 	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v dev_skip_attestation=%v",

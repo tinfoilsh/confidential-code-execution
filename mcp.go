@@ -63,9 +63,6 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token header is required"}
 			return http.StatusBadRequest, resp
 		}
-		// Gate the request on a recognized api_key via controlplane
-		// /api/shim/identity. Yes/no only — buckets re-resolves the same
-		// bearer itself when it needs the (user_id, org_id) prefix.
 		bearer := extractBearer(headers.Get("Authorization"))
 		if err := m.AuthorizeSession(ctx, bearer); err != nil {
 			if errors.Is(err, ErrAuthRequired) {
