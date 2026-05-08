@@ -1,6 +1,10 @@
 # Code Execution
 
-TODO: visualization.
+## MCP
+
+todo - contract
+
+## TODO: Code Visualization.
 
 1. the http server in main.go. Handles mcp
 2. The mcp redirect. Takes off the authorization & code execution keys. Any tool call goes to the orhcestrator
@@ -9,7 +13,7 @@ TODO: visualization.
 5. The orchestartor has a pool of warm containers, and a pool of active ones, corresponding to the map
 6. When a container needs to be destroyed, the manager snapshots & uploads it
 
-## manager
+## Manager
 
 Manages a warm pool of executor containers via the Tinfoil controlplane API. Routes requests by session ID so each client gets an isolated sandbox. The primary tool interface is MCP (`POST /mcp`).
 

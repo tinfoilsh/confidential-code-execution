@@ -215,87 +215,6 @@ func handleView(ctx context.Context, m *Manager, accessToken string, args map[st
 	return b.String(), nil
 }
 
-// extensionToLanguage maps file extensions to the language tag used in
-// markdown fenced code blocks. Unknown extensions return "" so the fence
-// renders without a language hint.
-var extensionToLanguage = map[string]string{
-	".py":         "python",
-	".js":         "javascript",
-	".jsx":        "jsx",
-	".ts":         "typescript",
-	".tsx":        "tsx",
-	".go":         "go",
-	".rs":         "rust",
-	".java":       "java",
-	".kt":         "kotlin",
-	".swift":      "swift",
-	".c":          "c",
-	".h":          "c",
-	".cc":         "cpp",
-	".cpp":        "cpp",
-	".cxx":        "cpp",
-	".hpp":        "cpp",
-	".cs":         "csharp",
-	".rb":         "ruby",
-	".php":        "php",
-	".sh":         "bash",
-	".bash":       "bash",
-	".zsh":        "bash",
-	".fish":       "bash",
-	".ps1":        "powershell",
-	".sql":        "sql",
-	".html":       "html",
-	".htm":        "html",
-	".css":        "css",
-	".scss":       "scss",
-	".sass":       "sass",
-	".less":       "less",
-	".json":       "json",
-	".jsonc":      "json",
-	".yaml":       "yaml",
-	".yml":        "yaml",
-	".toml":       "toml",
-	".xml":        "xml",
-	".md":         "markdown",
-	".markdown":   "markdown",
-	".tex":        "latex",
-	".r":          "r",
-	".lua":        "lua",
-	".pl":         "perl",
-	".scala":      "scala",
-	".clj":        "clojure",
-	".ex":         "elixir",
-	".exs":        "elixir",
-	".erl":        "erlang",
-	".hs":         "haskell",
-	".dart":       "dart",
-	".vim":        "vim",
-	".dockerfile": "dockerfile",
-	".makefile":   "makefile",
-	".cmake":      "cmake",
-	".graphql":    "graphql",
-	".proto":      "protobuf",
-}
-
-// inferLanguage picks a markdown code-fence language from a path. Falls back
-// to filename matches (Dockerfile, Makefile) before giving up.
-func inferLanguage(path string) string {
-	ext := strings.ToLower(filepath.Ext(path))
-	if lang, ok := extensionToLanguage[ext]; ok {
-		return lang
-	}
-	base := strings.ToLower(filepath.Base(path))
-	switch base {
-	case "dockerfile":
-		return "dockerfile"
-	case "makefile", "gnumakefile":
-		return "makefile"
-	case "cmakelists.txt":
-		return "cmake"
-	}
-	return ""
-}
-
 // handlePresent reads a file and returns it as a fenced markdown code
 // block with language inferred from extension. The router emits this
 // output as inline assistant content so the user sees the file rendered
@@ -306,32 +225,10 @@ func handlePresent(ctx context.Context, m *Manager, accessToken string, args map
 		return "", err
 	}
 	body := strings.Join(lines[start-1:end], "\n")
-	// Use a longer fence than any backtick run inside the file so nested
+	// Longer fence than any backtick run inside the file so nested
 	// triple-backtick code (common in markdown files) doesn't terminate it.
 	fence := longestFence(body)
 	return fmt.Sprintf("%s%s\n%s\n%s", fence, inferLanguage(path), body, fence), nil
-}
-
-// longestFence returns a backtick fence longer than any run of backticks
-// inside body, so embedding fenced code blocks won't break out.
-func longestFence(body string) string {
-	longest := 0
-	run := 0
-	for _, r := range body {
-		if r == '`' {
-			run++
-			if run > longest {
-				longest = run
-			}
-		} else {
-			run = 0
-		}
-	}
-	n := longest + 1
-	if n < 3 {
-		n = 3
-	}
-	return strings.Repeat("`", n)
 }
 
 func handleStrReplace(ctx context.Context, m *Manager, accessToken string, args map[string]any) (string, error) {
@@ -414,4 +311,111 @@ func handleInsert(ctx context.Context, m *Manager, accessToken string, args map[
 		return "", fmt.Errorf("%s", e)
 	}
 	return fmt.Sprintf("Inserted text after line %d in %s", lineNum, path), nil
+}
+
+// ---------------------------------------------------------------------------
+// present formatting
+// ---------------------------------------------------------------------------
+
+// extensionToLanguage maps file extensions to the language tag used in
+// markdown fenced code blocks. Unknown extensions return "" so the fence
+// renders without a language hint.
+var extensionToLanguage = map[string]string{
+	".py":         "python",
+	".js":         "javascript",
+	".jsx":        "jsx",
+	".ts":         "typescript",
+	".tsx":        "tsx",
+	".go":         "go",
+	".rs":         "rust",
+	".java":       "java",
+	".kt":         "kotlin",
+	".swift":      "swift",
+	".c":          "c",
+	".h":          "c",
+	".cc":         "cpp",
+	".cpp":        "cpp",
+	".cxx":        "cpp",
+	".hpp":        "cpp",
+	".cs":         "csharp",
+	".rb":         "ruby",
+	".php":        "php",
+	".sh":         "bash",
+	".bash":       "bash",
+	".zsh":        "bash",
+	".fish":       "bash",
+	".ps1":        "powershell",
+	".sql":        "sql",
+	".html":       "html",
+	".htm":        "html",
+	".css":        "css",
+	".scss":       "scss",
+	".sass":       "sass",
+	".less":       "less",
+	".json":       "json",
+	".jsonc":      "json",
+	".yaml":       "yaml",
+	".yml":        "yaml",
+	".toml":       "toml",
+	".xml":        "xml",
+	".md":         "markdown",
+	".markdown":   "markdown",
+	".tex":        "latex",
+	".r":          "r",
+	".lua":        "lua",
+	".pl":         "perl",
+	".scala":      "scala",
+	".clj":        "clojure",
+	".ex":         "elixir",
+	".exs":        "elixir",
+	".erl":        "erlang",
+	".hs":         "haskell",
+	".dart":       "dart",
+	".vim":        "vim",
+	".dockerfile": "dockerfile",
+	".makefile":   "makefile",
+	".cmake":      "cmake",
+	".graphql":    "graphql",
+	".proto":      "protobuf",
+}
+
+// inferLanguage picks a markdown code-fence language from a path. Falls back
+// to filename matches (Dockerfile, Makefile) before giving up.
+func inferLanguage(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if lang, ok := extensionToLanguage[ext]; ok {
+		return lang
+	}
+	base := strings.ToLower(filepath.Base(path))
+	switch base {
+	case "dockerfile":
+		return "dockerfile"
+	case "makefile", "gnumakefile":
+		return "makefile"
+	case "cmakelists.txt":
+		return "cmake"
+	}
+	return ""
+}
+
+// longestFence returns a backtick fence longer than any run of backticks
+// inside body, so embedding fenced code blocks won't break out.
+func longestFence(body string) string {
+	longest := 0
+	run := 0
+	for _, r := range body {
+		if r == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	n := longest + 1
+	if n < 3 {
+		n = 3
+	}
+	return strings.Repeat("`", n)
 }
