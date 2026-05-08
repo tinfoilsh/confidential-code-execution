@@ -977,19 +977,6 @@ func (m *Manager) FileExists(ctx context.Context, accessToken, path string) bool
 // Status
 // ---------------------------------------------------------------------------
 
-func (m *Manager) HealthInfo() map[string]any {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return map[string]any{
-		"status":         "ok",
-		"warm_pool":      len(m.warmPool),
-		"inflight":       len(m.inflight),
-		"sessions":       len(m.sessions),
-		"pool_target":    m.cfg.PoolSize,
-		"max_containers": m.cfg.MaxContainers,
-	}
-}
-
 func (m *Manager) MetricsInfo() map[string]any {
 	now := time.Now()
 	m.mu.Lock()

@@ -3,7 +3,6 @@
 // Thin HTTP server that routes:
 //
 //	POST /mcp        → MCP handler (primary tool interface)
-//	GET  /health     → health check
 //	GET  /metrics    → detailed metrics for viz.py
 //	POST /cleanup    → release a single session
 //	POST /delete-all → delete all containers
@@ -65,10 +64,10 @@ func main() {
 		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
 		HealthCheckInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 15)) * time.Second,
 		MaxHealthFailures:   envInt("MAX_HEALTH_FAILURES", 3),
-
+		// Execution Environment
 		EnvironmentRepo: envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
 		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.9"),
-
+		// Dev
 		DevSkipAttestation: envBool("DEV_SKIP_ATTESTATION", false),
 		DevBypassAuth:      envBool("DEV_BYPASS_AUTH", false),
 	}
@@ -89,9 +88,6 @@ func main() {
 	mux := http.NewServeMux()
 	srv := &http.Server{Addr: ":" + strconv.Itoa(port), Handler: mux}
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.HealthInfo())
-	})
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mgr.MetricsInfo())
 	})

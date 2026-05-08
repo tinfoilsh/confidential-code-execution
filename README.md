@@ -58,7 +58,6 @@ Tools: bash, view, present, str_replace, create, insert
 Admin endpoints:
 
 ```
-GET  /health        — pool counts
 GET  /metrics       — full container details (used by viz.py)
 POST /cleanup       {"codeExecutionAccessToken": "abc"}  — release a single session
 POST /delete-all    — delete all tracked containers (with name verification)
