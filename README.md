@@ -1,10 +1,17 @@
 # Code Execution
 
-## Orchestrator
+TODO: visualization.
+
+1. the http server in main.go. Handles mcp
+2. The mcp redirect. Takes off the authorization & code execution keys. Any tool call goes to the orhcestrator
+3. the manager recieves both of these keys as context. It has it's own map (different box in visualization). It maps a tool call to the container
+4. the container recieves the tool call & returns data.
+5. The orchestartor has a pool of warm containers, and a pool of active ones, corresponding to the map
+6. When a container needs to be destroyed, the manager snapshots & uploads it
+
+## manager
 
 Manages a warm pool of executor containers via the Tinfoil controlplane API. Routes requests by session ID so each client gets an isolated sandbox. The primary tool interface is MCP (`POST /mcp`).
-
-Written in Go. Stdlib only + `github.com/tinfoilsh/verifier` for enclave attestation.
 
 ### Run
 
@@ -22,13 +29,13 @@ go build .
 
 ### Environment variables
 
-| Variable         | Default                                | Notes                              |
-| ---------------- | -------------------------------------- | ---------------------------------- |
-| `ADMIN_API_KEY`  | _(required)_                           | Tinfoil controlplane bearer token  |
-| `POOL_SIZE`      | `3`                                    | Target warm pool size              |
-| `MAX_CONTAINERS` | `10`                                   | Hard cap on concurrent containers  |
-| `PORT`           | `7070`                                 | Orchestrator listen port           |
-| `POLL_INTERVAL`  | `2`                                    | Seconds between controlplane polls |
+| Variable           | Default                                | Notes                              |
+| ------------------ | -------------------------------------- | ---------------------------------- |
+| `ADMIN_API_KEY`    | _(required)_                           | Tinfoil controlplane bearer token  |
+| `POOL_SIZE`        | `3`                                    | Target warm pool size              |
+| `MAX_CONTAINERS`   | `10`                                   | Hard cap on concurrent containers  |
+| `PORT`             | `7070`                                 | manager listen port                |
+| `POLL_INTERVAL`    | `2`                                    | Seconds between controlplane polls |
 | `ENVIRONMENT_REPO` | `tinfoilsh/code-execution-environment` | Source repo for the executor image |
 | `ENVIRONMENT_TAG`  | `v0.0.9`                               | Image tag to deploy                |
 
@@ -62,7 +69,7 @@ Other endpoints:
 GET /metrics — full container details (used by viz.py)
 ```
 
-On `SIGINT`/`SIGTERM` the orchestrator snapshots every active session to
+On `SIGINT`/`SIGTERM` the manager snapshots every active session to
 buckets, deletes every container it owns on controlplane, then exits —
 so a deploy or local `ctrl-c` doesn't leak containers or session state.
 
