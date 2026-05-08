@@ -17,13 +17,12 @@
 flowchart TD
     C[Client] --> M[POST /mcp]
     M --> A[validate api_key]
-    A -.-> CP[(Controlplane)]
-    A --> G{session known?}
+    A <-.-> CP[(Controlplane)]
+    A --> G{existing session?}
     G -->|yes| E[container: exec, read, write]
-    G -->|no| P[pop warm + restore]
-    P -.-> B[(Buckets)]
+    G -->|no| P[pop a warm container + restore]
+    P <-.-> B[(Buckets)]
     P --> E
-    E --> R[response]
 
     classDef ext stroke-dasharray:5 5
     class CP,B ext
