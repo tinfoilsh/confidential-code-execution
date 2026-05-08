@@ -22,7 +22,7 @@ import (
 // tool can't tie up a session for the full 90s.
 func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
 	if m.cfg.DevSkipAttestation {
-		log.Printf("orchestrator: skipping attestation for %s (%s)", c.Name, c.Domain)
+		log.Printf("orchestrator: WARNING attestation disabled (DEV_SKIP_ATTESTATION) for %s", c.Name)
 		return &http.Client{Timeout: 90 * time.Second}, nil
 	}
 	sc := client.NewSecureClient(c.Domain, m.cfg.EnvironmentRepo)
@@ -31,7 +31,6 @@ func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
 		return nil, err
 	}
 	httpClient.Timeout = 90 * time.Second
-	log.Printf("orchestrator: attestation verified for %s (%s)", c.Name, c.Domain)
 	return httpClient, nil
 }
 
@@ -97,7 +96,7 @@ func (m *Manager) ExecCommand(ctx context.Context, accessToken, command string) 
 	status, raw, _ := m.proxy(ctx, c, accessToken, "/exec", body)
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status), "raw": string(raw)}
+		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status)}
 	}
 	return out
 }

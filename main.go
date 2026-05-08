@@ -101,9 +101,14 @@ func main() {
 
 	port := envInt("PORT", 7070)
 
-	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v dev_skip_attestation=%v",
-		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.DevSkipAttestation)
-	log.Printf("environment container: repo=%s tag=%s", cfg.EnvironmentRepo, cfg.EnvironmentTag)
+	log.Printf("orchestrator: pool=%d max=%d env=%s:%s",
+		cfg.PoolSize, cfg.MaxContainers, cfg.EnvironmentRepo, cfg.EnvironmentTag)
+	if cfg.DevSkipAttestation {
+		log.Printf("orchestrator: WARNING DEV_SKIP_ATTESTATION=true")
+	}
+	if cfg.DevBypassAuth {
+		log.Printf("orchestrator: WARNING DEV_BYPASS_AUTH=true")
+	}
 	mgr := NewManager(cfg)
 	registerPoolGauges(mgr)
 	mgr.StartPoolManager()

@@ -58,9 +58,6 @@ func (cp *Controlplane) do(ctx context.Context, method, path string, body any) (
 	if resp.StatusCode >= 500 {
 		controlplaneErrors.Inc()
 	}
-	if resp.StatusCode >= 400 {
-		log.Printf("orchestrator: API error %d %s %s", resp.StatusCode, method, path)
-	}
 	if err != nil {
 		return resp.StatusCode, nil, err
 	}
@@ -126,7 +123,6 @@ func (cp *Controlplane) deleteContainer(id string) {
 func (cp *Controlplane) verifyContainerName(c *Container) bool {
 	status, raw, err := cp.do(context.Background(), "GET", "/api/containers/"+c.ID, nil)
 	if err != nil || status != 200 {
-		log.Printf("orchestrator: skip delete %s (%s) — not found on controlplane (%d)", c.Name, c.ID, status)
 		return false
 	}
 	var resp struct {
@@ -134,7 +130,7 @@ func (cp *Controlplane) verifyContainerName(c *Container) bool {
 	}
 	json.Unmarshal(raw, &resp)
 	if resp.Name != c.Name {
-		log.Printf("orchestrator: skip delete %s (%s) — name mismatch: remote=%s", c.Name, c.ID, resp.Name)
+		log.Printf("orchestrator: skip delete %s — controlplane name mismatch", c.ID)
 		return false
 	}
 	return true

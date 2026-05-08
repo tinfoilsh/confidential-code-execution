@@ -141,10 +141,8 @@ func (m *Manager) replenishPool() []*Container {
 	for i := 0; i < needed; i++ {
 		c, err := m.cp.createContainer(m.cfg.EnvironmentRepo, m.cfg.EnvironmentTag)
 		if err != nil {
-			log.Printf("orchestrator: %v", err)
 			break
 		}
-		log.Printf("orchestrator: created container %s (%s)", c.Name, c.ID)
 		created = append(created, c)
 	}
 	if len(created) > 0 {
@@ -167,7 +165,6 @@ func (m *Manager) pollInflight() {
 		case "ready":
 			cli, err := m.buildProxyClient(c)
 			if err != nil {
-				log.Printf("orchestrator: attestation failed for %s: %v", c.Name, err)
 				attestationFailures.Inc()
 				failed = append(failed, c)
 				continue
@@ -175,10 +172,8 @@ func (m *Manager) pollInflight() {
 			c.httpClient = cli
 			c.Status = "ready"
 			ready = append(ready, c)
-			log.Printf("orchestrator: container %s is ready", c.Name)
 		case "failed":
 			failed = append(failed, c)
-			log.Printf("orchestrator: container %s failed", c.Name)
 		}
 	}
 
@@ -262,9 +257,6 @@ func (m *Manager) poolManagerLoop() {
 		if delay > 30*time.Second {
 			delay = 30 * time.Second
 		}
-		if consecutiveFailures > 0 && consecutiveFailures%5 == 1 {
-			log.Printf("orchestrator: create failing, backoff %v (consecutive failures: %d)", delay, consecutiveFailures)
-		}
 		time.Sleep(delay)
 	}
 }
@@ -314,7 +306,6 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 			}
 			if isConnected != nil && !isConnected() {
 				m.mu.Unlock()
-				log.Printf("orchestrator: client disconnected while waiting for session")
 				return nil, "client disconnected"
 			}
 			// wake every 2s to re-check connection / deadline
@@ -332,7 +323,6 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 			c = candidate
 			break
 		}
-		log.Printf("orchestrator: warm container %s failed pre-assign /health, discarding", candidate.Name)
 		candidate.Status = "failed"
 		go m.cp.deleteContainer(candidate.ID)
 	}
@@ -352,11 +342,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	// Restore failures fall through to a fresh empty workspace — better
 	// than refusing to assign and breaking the user's chat.
 	if codeExecutionEncryptionKey != "" && bearer != "" {
-		if err := m.restoreInto(ctx, bearer, accessToken, c, codeExecutionEncryptionKey); err != nil {
-			log.Printf("orchestrator: restore failed on %s: %v (continuing with empty workspace)", c.Name, err)
-		} else {
-			log.Printf("orchestrator: restore complete on %s", c.Name)
-		}
+		_ = m.restoreInto(ctx, bearer, accessToken, c, codeExecutionEncryptionKey)
 	}
 
 	// Mark assigned only AFTER restore so the eviction loop can't trip
@@ -366,7 +352,6 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	m.sessions[accessToken] = c
 	m.mu.Unlock()
 
-	log.Printf("orchestrator: assigned %s to a session", c.Name)
 	return c, ""
 }
 
@@ -387,7 +372,6 @@ func (m *Manager) restoreInto(ctx context.Context, bearer, accessToken string, c
 	// mismatch, 410 window closed) won't recover — bail.
 	status, err := m.pushRestore(c, accessToken, tarBytes)
 	if err != nil && (status == 0 || status >= 500) {
-		log.Printf("orchestrator: pushRestore transient failure: %v — retrying once", err)
 		time.Sleep(restorePushRetryDelay)
 		_, err = m.pushRestore(c, accessToken, tarBytes)
 	}
@@ -411,7 +395,6 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 		return nil
 	}
 	c.Status = "deleting"
-	log.Printf("orchestrator: cleaning up session container %s", c.Name)
 	go m.cp.deleteContainer(c.ID)
 	return c
 }
@@ -421,32 +404,24 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 // losing state is bad, leaving stale containers is worse.
 func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 	switch {
-	case c.CodeExecutionEncryptionKey == "":
-		log.Printf("orchestrator: no code execution encryption key cached for session — skipping snapshot")
-		snapshots.WithLabelValues("skipped").Inc()
-	case c.Bearer == "":
-		log.Printf("orchestrator: no api_key bearer cached for session — skipping snapshot")
+	case c.CodeExecutionEncryptionKey == "", c.Bearer == "":
 		snapshots.WithLabelValues("skipped").Inc()
 	default:
 		ctx := context.Background()
 		tarBytes, err := m.fetchSnapshotFromContainer(c, accessToken)
 		if err != nil {
-			log.Printf("orchestrator: snapshot failed on %s: %v", c.Name, err)
 			snapshots.WithLabelValues("failure").Inc()
 		} else {
 			// One retry on transient PUT failure: a single buckets blip
 			// shouldn't cost a user their workspace.
 			putErr := m.buckets.put(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			if putErr != nil {
-				log.Printf("orchestrator: PUT snapshot failed: %v — retrying once", putErr)
 				time.Sleep(snapshotPutRetryDelay)
 				putErr = m.buckets.put(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			}
 			if putErr != nil {
-				log.Printf("orchestrator: PUT snapshot failed after retry: %v", putErr)
 				snapshots.WithLabelValues("failure").Inc()
 			} else {
-				log.Printf("orchestrator: snapshotted container %s to buckets", c.Name)
 				snapshots.WithLabelValues("success").Inc()
 			}
 		}
@@ -491,7 +466,6 @@ func (m *Manager) evictIdleSessions() {
 	m.mu.Unlock()
 
 	for _, t := range targets {
-		log.Printf("orchestrator: idle-evicting session on %s (idle ~%v)", t.c.Name, m.cfg.IdleTimeout)
 		m.evictAndSnapshot(t.accessToken, t.c)
 		m.mu.Lock()
 		delete(m.assignLocks, t.accessToken)
@@ -537,9 +511,7 @@ func (m *Manager) healthCheckLoop() {
 	}
 }
 
-// shouldEvictForHealth probes /health, updates HealthFailures, and
-// returns true iff the threshold was hit. label ("warm" / "session")
-// is used as both a log tag and a metric label.
+// label ("warm" / "session")
 func (m *Manager) shouldEvictForHealth(c *Container, label string) bool {
 	if m.checkContainerHealth(c) {
 		m.mu.Lock()
@@ -552,7 +524,6 @@ func (m *Manager) shouldEvictForHealth(c *Container, label string) bool {
 	n := c.HealthFailures
 	m.mu.Unlock()
 	if n < m.cfg.MaxHealthFailures {
-		log.Printf("orchestrator: %s container %s /health failed (%d/%d)", label, c.Name, n, m.cfg.MaxHealthFailures)
 		return false
 	}
 	healthFailures.WithLabelValues(label).Inc()
@@ -582,8 +553,6 @@ func (m *Manager) scanWarmHealth() {
 		}
 		m.mu.Unlock()
 		if evicted {
-			log.Printf("orchestrator: warm container %s exceeded health failure threshold (%d) — destroying",
-				c.Name, m.cfg.MaxHealthFailures)
 			go m.cp.deleteContainer(c.ID)
 		}
 	}
@@ -620,8 +589,6 @@ func (m *Manager) scanSessionHealth() {
 		delete(m.sessions, t.accessToken)
 		m.mu.Unlock()
 
-		log.Printf("orchestrator: session on %s exceeded health failure threshold (%d) — snapshotting + destroying",
-			t.c.Name, m.cfg.MaxHealthFailures)
 		go func(accessToken string, c *Container) {
 			m.evictAndSnapshot(accessToken, c)
 			m.mu.Lock()
@@ -652,7 +619,6 @@ func (m *Manager) CleanupAll() {
 		if !m.cp.verifyContainerName(c) {
 			continue
 		}
-		log.Printf("orchestrator: deleting %s (%s) — verified", c.Name, c.ID)
 		m.cp.deleteContainer(c.ID)
 	}
 }
@@ -663,7 +629,6 @@ func (m *Manager) CleanupAll() {
 // CleanupAll's plain delete — their state is lost.
 func (m *Manager) Finish() {
 	m.shuttingDown = true
-	log.Printf("orchestrator: finishing — snapshotting sessions and deleting all containers")
 
 	type target struct {
 		accessToken string
@@ -692,10 +657,8 @@ func (m *Manager) Finish() {
 		go func() { wg.Wait(); close(done) }()
 		select {
 		case <-done:
-			log.Printf("orchestrator: snapshotted %d session(s) on shutdown", len(targets))
 		case <-time.After(m.cfg.ShutdownDeadline):
-			log.Printf("orchestrator: snapshot deadline (%v) hit before all %d session(s) finished — proceeding to cleanup",
-				m.cfg.ShutdownDeadline, len(targets))
+			log.Printf("orchestrator: shutdown deadline (%v) hit, %d session snapshot(s) may have been lost", m.cfg.ShutdownDeadline, len(targets))
 		}
 	}
 
