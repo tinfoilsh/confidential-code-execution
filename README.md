@@ -64,10 +64,11 @@ flowchart LR
     subgraph Health[Health Checker]
         direction TB
         H1[tick: HEALTH_CHECK_INTERVAL]
-        H1 --> H2[GET container /health]
+        H1 --> H2[GET /health<br/>warm + session containers]
         H2 -->|200| H3[reset HealthFailures]
         H2 -->|fail| H4[HealthFailures++]
-        H4 -->|≥ MAX_HEALTH_FAILURES| H5[evict + delete]
+        H4 -->|≥ MAX, warm| H5[delete]
+        H4 -->|≥ MAX, session| H6[snapshot + delete]
     end
 
     subgraph Evict[Idle Evictor]
@@ -100,7 +101,7 @@ stateDiagram-v2
     ready --> assigning: GetOrAssign + /health ok
     assigning --> assigned: restore-on-assign done
     assigned --> assigned: tools/call (refresh LastActivity)
-    assigned --> deleting: idle evict or shutdown<br/>(snapshot to buckets first)
+    assigned --> deleting: idle evict, /health fail × MAX, or shutdown<br/>(snapshot to buckets first)
     deleting --> [*]
     failed --> [*]
 ```

@@ -747,9 +747,11 @@ func (m *Manager) checkContainerHealth(c *Container) bool {
 }
 
 // StartHealthCheckLoop launches the background goroutine that probes
-// every warm container's /health on a fixed cadence. Containers that
-// fail MaxHealthFailures consecutive checks are evicted + destroyed; the
-// pool manager replenishes on its next tick.
+// every warm and assigned container's /health on a fixed cadence.
+// Warm containers that fail MaxHealthFailures consecutive checks are
+// destroyed (pool manager replenishes); session containers go through
+// the snapshot-then-delete path so workspace state has a chance to
+// survive.
 func (m *Manager) StartHealthCheckLoop() {
 	go m.healthCheckLoop()
 }
@@ -761,38 +763,45 @@ func (m *Manager) healthCheckLoop() {
 			return
 		}
 		m.scanWarmHealth()
+		m.scanSessionHealth()
 	}
 }
 
-// scanWarmHealth probes /health on each warm container once. Successes
-// reset HealthFailures; failures bump it. A container that hits
-// MaxHealthFailures is removed from the warm pool and destroyed. We
-// snapshot the warm pool under m.mu, then run the (slow) network
-// probes lock-free. A container that's been pulled by GetOrAssign in
-// the meantime is no longer in m.warmPool when we go to evict, so the
-// final removal step is a no-op for it — that's fine, an in-flight
-// request will surface the failure on its own (proxy 502 or eviction).
+// shouldEvictForHealth probes /health, updates HealthFailures, and
+// returns true iff the threshold was hit and the caller should evict.
+// label is just a log tag ("warm" / "session").
+func (m *Manager) shouldEvictForHealth(c *Container, label string) bool {
+	if m.checkContainerHealth(c) {
+		m.mu.Lock()
+		c.HealthFailures = 0
+		m.mu.Unlock()
+		return false
+	}
+	m.mu.Lock()
+	c.HealthFailures++
+	n := c.HealthFailures
+	m.mu.Unlock()
+	if n < m.cfg.MaxHealthFailures {
+		log.Printf("orchestrator: %s container %s /health failed (%d/%d)", label, c.Name, n, m.cfg.MaxHealthFailures)
+		return false
+	}
+	return true
+}
+
+// scanWarmHealth probes warm containers and plain-deletes any that hit
+// the failure threshold. A container that's been pulled by GetOrAssign
+// since we snapshotted the pool is no longer in m.warmPool when we go
+// to evict — the removal becomes a no-op and the in-flight request
+// surfaces the failure on its own.
 func (m *Manager) scanWarmHealth() {
 	m.mu.Lock()
 	targets := append([]*Container(nil), m.warmPool...)
 	m.mu.Unlock()
 
 	for _, c := range targets {
-		if m.checkContainerHealth(c) {
-			m.mu.Lock()
-			c.HealthFailures = 0
-			m.mu.Unlock()
+		if !m.shouldEvictForHealth(c, "warm") {
 			continue
 		}
-		m.mu.Lock()
-		c.HealthFailures++
-		n := c.HealthFailures
-		m.mu.Unlock()
-		if n < m.cfg.MaxHealthFailures {
-			log.Printf("orchestrator: warm container %s /health failed (%d/%d)", c.Name, n, m.cfg.MaxHealthFailures)
-			continue
-		}
-
 		m.mu.Lock()
 		evicted := false
 		for i, x := range m.warmPool {
@@ -811,12 +820,54 @@ func (m *Manager) scanWarmHealth() {
 			}
 		}
 		m.mu.Unlock()
-
 		if evicted {
 			log.Printf("orchestrator: warm container %s exceeded health failure threshold (%d) — destroying",
 				c.Name, m.cfg.MaxHealthFailures)
 			go m.deleteContainer(c.ID)
 		}
+	}
+}
+
+// scanSessionHealth probes session containers and routes failed ones
+// through evictAndSnapshot so workspace state can survive when the
+// container is dead (snapshot fetch will fail; evictAndSnapshot logs
+// and falls back to plain delete). Async so a slow snapshot doesn't
+// block the next health tick.
+func (m *Manager) scanSessionHealth() {
+	type target struct {
+		accessToken string
+		c           *Container
+	}
+	m.mu.Lock()
+	targets := make([]target, 0, len(m.sessions))
+	for sid, c := range m.sessions {
+		targets = append(targets, target{sid, c})
+	}
+	m.mu.Unlock()
+
+	for _, t := range targets {
+		if !m.shouldEvictForHealth(t.c, "session") {
+			continue
+		}
+		m.mu.Lock()
+		// Drop only if it's still us — racing eviction or assign-reuse
+		// could have already moved/replaced this entry.
+		cur, ok := m.sessions[t.accessToken]
+		if !ok || cur != t.c {
+			m.mu.Unlock()
+			continue
+		}
+		delete(m.sessions, t.accessToken)
+		m.mu.Unlock()
+
+		log.Printf("orchestrator: session %s on %s exceeded health failure threshold (%d) — snapshotting + destroying",
+			t.accessToken, t.c.Name, m.cfg.MaxHealthFailures)
+		go func(accessToken string, c *Container) {
+			m.evictAndSnapshot(accessToken, c)
+			m.mu.Lock()
+			delete(m.assignLocks, accessToken)
+			m.mu.Unlock()
+		}(t.accessToken, t.c)
 	}
 }
 
