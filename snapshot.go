@@ -24,30 +24,13 @@ import (
 // The HTTP trailer the environment sets to true once it's finished streaming
 const snapshotTrailer = "X-Snapshot-Status"
 
-// decodeBase64Lenient accepts std, raw-std, url, or raw-url base64.
-// Webapp headers tend to be url-safe with no padding; std-encoded values
-// show up on the bucket wire format. Lets callers stay agnostic.
-func decodeBase64Lenient(s string) ([]byte, error) {
-	for _, enc := range []*base64.Encoding{
-		base64.StdEncoding,
-		base64.RawStdEncoding,
-		base64.URLEncoding,
-		base64.RawURLEncoding,
-	} {
-		if b, err := enc.DecodeString(s); err == nil {
-			return b, nil
-		}
-	}
-	return nil, fmt.Errorf("not valid base64")
-}
-
-// toStdBase64 normalizes any base64 variant to std (with padding).
-// Buckets only accepts std base64 in JSON bodies and the X-Encryption-Key
-// header, so we convert at the wire boundary.
-func toStdBase64(s string) (string, error) {
-	raw, err := decodeBase64Lenient(s)
+// urlBase64ToStd converts the webapp's url-safe-no-padding key (idiomatic
+// JS, matches the passkey/WebAuthn ecosystem) to std-base64, which is
+// what buckets expects.
+func urlBase64ToStd(b64url string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(b64url)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("decode encryption key: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(raw), nil
 }
@@ -61,9 +44,9 @@ func toStdBase64(s string) (string, error) {
 // The bearer is the user's api_key — buckets resolves it to the owning
 // (user_id, org_id) and uses that as the R2 storage prefix.
 func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
-	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
+	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
-		return nil, fmt.Errorf("decode code execution encryption key: %w", err)
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", m.cfg.BucketsBase+"/items/"+accessToken, nil)
 	if err != nil {
@@ -111,9 +94,9 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, cod
 // The bearer is the user's api_key — buckets resolves it to the owning
 // (user_id, org_id) and uses that as the R2 storage prefix.
 func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
-	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
+	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
-		return fmt.Errorf("decode code execution encryption key: %w", err)
+		return err
 	}
 	body, err := json.Marshal(map[string]any{
 		"value":           base64.StdEncoding.EncodeToString(tarBytes),

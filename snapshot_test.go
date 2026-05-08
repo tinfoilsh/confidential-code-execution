@@ -27,33 +27,12 @@ import (
 	"time"
 )
 
-func TestDecodeBase64Lenient(t *testing.T) {
-	want := []byte{0x01, 0x02, 0x03, 0x04, 0xfe, 0xff}
-	for name, enc := range map[string]*base64.Encoding{
-		"std":     base64.StdEncoding,
-		"raw-std": base64.RawStdEncoding,
-		"url":     base64.URLEncoding,
-		"raw-url": base64.RawURLEncoding,
-	} {
-		got, err := decodeBase64Lenient(enc.EncodeToString(want))
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("%s: round trip mismatch", name)
-		}
-	}
-	if _, err := decodeBase64Lenient("$$$not-base64$$$"); err == nil {
-		t.Fatalf("expected error on garbage input")
-	}
-}
-
-func TestToStdBase64ConvertsURL(t *testing.T) {
+func TestURLBase64ToStd(t *testing.T) {
 	want := []byte{0xfa, 0xfb, 0xfc, 0xfd}
 	urlForm := base64.RawURLEncoding.EncodeToString(want)
-	std, err := toStdBase64(urlForm)
+	std, err := urlBase64ToStd(urlForm)
 	if err != nil {
-		t.Fatalf("toStdBase64: %v", err)
+		t.Fatalf("urlBase64ToStd: %v", err)
 	}
 	got, err := base64.StdEncoding.DecodeString(std)
 	if err != nil {
@@ -316,7 +295,7 @@ func TestEvictAndSnapshot(t *testing.T) {
 	c := fakeContainer(fc)
 
 	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
-	keyStd, _ := toStdBase64(keyURL)
+	keyStd, _ := urlBase64ToStd(keyURL)
 	c.CodeExecutionEncryptionKey = keyURL
 	c.Bearer = "tk_test"
 
