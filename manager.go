@@ -17,33 +17,20 @@ import (
 	"github.com/tinfoilsh/verifier/client"
 )
 
-// snapshotPutRetryDelay is how long evictAndSnapshot waits between
-// the first and second attempt to PUT a snapshot tar to buckets.
-// Variable so tests can shrink it.
+// Operation timing
 var snapshotPutRetryDelay = 1 * time.Second
-
-// restorePushRetryDelay is the pause between the first and second
-// pushRestore attempt when the first sees a transient failure. The
-// executor's api-server keeps the restore window open across multiple
-// /restore calls (the token gate also tolerates same-token retries), so
-// a single retry is safe to layer on top. Variable so tests can shrink it.
 var restorePushRetryDelay = 1 * time.Second
-
-// toolCallTimeout caps individual /exec, /read, and /write calls. The
-// container http.Client has a 90s ceiling for snapshot/restore bulk
-// transfers; this shorter budget keeps tool calls bounded so a runaway
-// bash command doesn't tie up a session for the full 90s.
 var toolCallTimeout = 35 * time.Second
 
+// Per-sandbox environment configuration
 type Container struct {
 	ID         string
 	Name       string
 	Domain     string
-	Status     string
+	Status     string //todo: can I enum this?
 	CreatedAt  time.Time
 	AssignedAt time.Time
-
-	httpClient *http.Client // proxy client (attested or plain)
+	httpClient *http.Client
 
 	// CodeExecutionEncryptionKey is the user's symmetric AES-256 key
 	// (base64-encoded), cached from the request's

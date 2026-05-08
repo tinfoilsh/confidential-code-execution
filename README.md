@@ -1,8 +1,13 @@
 # Code Execution
 
-## MCP
+## MCP tools
 
-todo - contract
+- `bash` — run a bash command in the container; returns stdout, stderr, exit code.
+- `view` — read a file with line numbers, optionally a `[start, end]` range.
+- `present` — render a file inline in the chat as a syntax-highlighted code block (the user sees it directly).
+- `str_replace` — replace one exact occurrence of `old_str` with `new_str` in a file.
+- `create` — create a new file with given contents; fails if it already exists.
+- `insert` — insert text after a given line number in a file.
 
 ## TODO: Code Visualization.
 
