@@ -385,6 +385,46 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	}
 }
 
+func TestFinishSnapshotsActiveSessions(t *testing.T) {
+	// Shutdown must take the same snapshot-then-delete path as idle eviction
+	// for any session with a cached key+bearer. Anything that doesn't get
+	// snapshotted on shutdown is workspace state lost on the next deploy.
+	plainTar := []byte("session-tar-bytes")
+	fc := newFakeContainer(plainTar)
+	defer fc.Close()
+	c := fakeContainer(fc)
+	c.CodeExecutionEncryptionKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x33}, 32))
+	c.Bearer = "tk_test"
+
+	bk := newFakeBuckets()
+	defer bk.Close()
+	prev := bucketsBase
+	bucketsBase = bk.URL
+	defer func() { bucketsBase = prev }()
+
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", ShutdownDeadline: 5 * time.Second})
+	m.sessions["sess-shutdown"] = c
+
+	m.Finish()
+
+	bk.mu.Lock()
+	stored, ok := bk.stored["sess-shutdown"]
+	bk.mu.Unlock()
+	if !ok {
+		t.Fatalf("expected snapshot PUT on shutdown")
+	}
+	if !bytes.Equal(stored.plaintext, plainTar) {
+		t.Fatalf("snapshot plaintext mismatch")
+	}
+
+	m.mu.Lock()
+	left := len(m.sessions)
+	m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("expected sessions drained, got %d", left)
+	}
+}
+
 func TestFetchSnapshotRejectsTruncatedStream(t *testing.T) {
 	// /snapshot returns 200 + body but no X-Snapshot-Status trailer —
 	// mirrors the executor hitting a walk error mid-tar. The orchestrator

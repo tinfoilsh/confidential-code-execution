@@ -83,12 +83,12 @@ type Container struct {
 }
 
 type ManagerConfig struct {
-	AdminAPIKey       string
-	PoolSize          int
-	MaxContainers     int
-	PollInterval      time.Duration
-	EnvironmentRepo   string
-	EnvironmentTag    string
+	AdminAPIKey     string
+	PoolSize        int
+	MaxContainers   int
+	PollInterval    time.Duration
+	EnvironmentRepo string
+	EnvironmentTag  string
 	// DevSkipAttestation skips enclave attestation. Local dev only.
 	DevSkipAttestation bool
 	// DevBypassAuth skips api_key validation. Local dev only.
@@ -111,6 +111,11 @@ type ManagerConfig struct {
 	// the health checker yanks a warm container from the pool and
 	// destroys it.
 	MaxHealthFailures int
+	// ShutdownDeadline caps the time Finish spends snapshotting active
+	// sessions before bulk-deleting whatever's left. Tune per platform:
+	// k8s/ECS default 30s grace fits 25s; Cloud Run/Docker default 10s
+	// needs a smaller value (or a longer grace period).
+	ShutdownDeadline time.Duration
 }
 
 type Manager struct {
@@ -145,6 +150,9 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 	if cfg.MaxHealthFailures == 0 {
 		cfg.MaxHealthFailures = 3
+	}
+	if cfg.ShutdownDeadline == 0 {
+		cfg.ShutdownDeadline = 25 * time.Second
 	}
 	m := &Manager{
 		cfg:         cfg,
@@ -845,9 +853,52 @@ func (m *Manager) CleanupAll() map[string]any {
 	return map[string]any{"deleted": deleted, "skipped": skipped, "count": len(deleted)}
 }
 
+// Finish snapshots every active session in parallel (mirroring the idle
+// eviction path) then bulk-deletes any remaining containers. Bounded by
+// cfg.ShutdownDeadline so we exit cleanly under the platform's grace
+// period.
+//
+// Sessions whose snapshot doesn't finish in time fall through to
+// CleanupAll's plain delete — their state is lost. Warm and inflight
+// containers go straight to plain delete (no user state to preserve).
 func (m *Manager) Finish() map[string]any {
 	m.shuttingDown = true
-	log.Printf("orchestrator: finishing — deleting all containers and shutting down")
+	log.Printf("orchestrator: finishing — snapshotting sessions and deleting all containers")
+
+	type target struct {
+		accessToken string
+		c           *Container
+	}
+	var targets []target
+	m.mu.Lock()
+	for sid, c := range m.sessions {
+		targets = append(targets, target{sid, c})
+	}
+	// Drop session entries up front so CleanupAll doesn't double-delete
+	// the container we're about to evictAndSnapshot.
+	m.sessions = map[string]*Container{}
+	m.mu.Unlock()
+
+	if len(targets) > 0 {
+		var wg sync.WaitGroup
+		for _, t := range targets {
+			wg.Add(1)
+			go func(t target) {
+				defer wg.Done()
+				m.evictAndSnapshot(t.accessToken, t.c)
+			}(t)
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+			log.Printf("orchestrator: snapshotted %d session(s) on shutdown", len(targets))
+		case <-time.After(m.cfg.ShutdownDeadline):
+			log.Printf("orchestrator: snapshot deadline (%v) hit before all %d session(s) finished — proceeding to cleanup",
+				m.cfg.ShutdownDeadline, len(targets))
+		}
+	}
+
 	result := m.CleanupAll()
 	result["status"] = "finished"
 	return result

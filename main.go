@@ -2,11 +2,11 @@
 //
 // Thin HTTP server that routes:
 //
-//	POST /mcp        → MCP handler (primary tool interface)
-//	GET  /metrics    → detailed metrics for viz.py
-//	POST /cleanup    → release a single session
-//	POST /delete-all → delete all containers
-//	POST /finish     → delete all + shutdown
+//	POST /mcp     → MCP handler (primary tool interface)
+//	GET  /metrics → metrics showing the container status, load, etc.
+//
+// On SIGINT/SIGTERM the orchestrator snapshots every active session to
+// buckets & deletes every container it owns
 package main
 
 import (
@@ -64,6 +64,7 @@ func main() {
 		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
 		HealthCheckInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 15)) * time.Second,
 		MaxHealthFailures:   envInt("MAX_HEALTH_FAILURES", 3),
+		ShutdownDeadline:    time.Duration(envInt("SHUTDOWN_DEADLINE", 25)) * time.Second,
 		// Execution Environment
 		EnvironmentRepo: envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
 		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.9"),
@@ -90,34 +91,6 @@ func main() {
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, mgr.MetricsInfo())
-	})
-	mux.HandleFunc("/cleanup", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			AccessToken string `json:"codeExecutionAccessToken"`
-		}
-		json.NewDecoder(r.Body).Decode(&body)
-		if body.AccessToken == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "codeExecutionAccessToken is required"})
-			return
-		}
-		c := mgr.CleanupSession(body.AccessToken)
-		if c == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no session found for " + body.AccessToken})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "cleaned up", "container": c.Name})
-	})
-	mux.HandleFunc("/delete-all", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.CleanupAll())
-	})
-	mux.HandleFunc("/finish", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.Finish())
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			srv.Shutdown(ctx)
-		}()
 	})
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
 		var req jsonRPCRequest

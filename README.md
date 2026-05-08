@@ -37,6 +37,7 @@ go build .
 | `DEV_BYPASS_AUTH` | `false` | Local dev only — skip api_key validation. Never set in prod. |
 | `HEALTH_CHECK_INTERVAL` | `15` | Seconds between `/health` probes of warm containers. |
 | `MAX_HEALTH_FAILURES` | `3` | Consecutive `/health` failures before a warm container is destroyed and replaced. |
+| `SHUTDOWN_DEADLINE` | `25` | Seconds spent snapshotting sessions on SIGTERM before bulk-delete. Tune per platform grace period. |
 
 ### API
 
@@ -55,14 +56,15 @@ Methods:
 Tools: bash, view, present, str_replace, create, insert
 ```
 
-Admin endpoints:
+Other endpoints:
 
 ```
-GET  /metrics       — full container details (used by viz.py)
-POST /cleanup       {"codeExecutionAccessToken": "abc"}  — release a single session
-POST /delete-all    — delete all tracked containers (with name verification)
-POST /finish        — delete all containers and shut down the server
+GET /metrics — full container details (used by viz.py)
 ```
+
+On `SIGINT`/`SIGTERM` the orchestrator snapshots every active session to
+buckets, deletes every container it owns on controlplane, then exits —
+so a deploy or local `ctrl-c` doesn't leak containers or session state.
 
 ### Visualizer
 
