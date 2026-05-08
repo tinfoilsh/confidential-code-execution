@@ -1,7 +1,7 @@
 package main
 
 // Snapshot & save a containers' filesystem.
-// The bucket service handles encryption end-to-end. We pass plaintext & accessToken & encryption key
+// The bucket service handles encryption end-to-end. We pass plaintext, accessToken, encryption key, api key
 //
 // Flow:
 //
@@ -35,14 +35,8 @@ func urlBase64ToStd(b64url string) (string, error) {
 	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
-// fetchSnapshotTar pulls the plaintext tar for accessToken from buckets.
-// Returns (nil, nil) when the bucket has no entry for this accessToken
-// (404), or when the supplied key can't open the entry (403 — wrong
-// key or corrupt envelope). Both cases are non-fatal: GetOrAssign
-// proceeds with a fresh empty workspace.
-//
-// The bearer is the user's api_key — buckets resolves it to the owning
-// (user_id, org_id) and uses that as the R2 storage prefix.
+// Pulls the plaintext tar for accessToken from buckets (requires Bearer)
+// Returns (nil, nil) when on 403 or 404.
 func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
 	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
@@ -67,7 +61,7 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, cod
 		return nil, nil
 	}
 	if resp.StatusCode == http.StatusForbidden {
-		// Wrong key or corrupt envelope. Caller logs and starts fresh.
+		// Wrong key or corrupt envelope.
 		return nil, nil
 	}
 	if resp.StatusCode >= 400 {
@@ -87,12 +81,7 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, cod
 	return tarBytes, nil
 }
 
-// putSnapshotTar PUTs the plaintext tar to buckets, encrypting under the
-// supplied Code Execution Encryption Key. Buckets generates a fresh DEK
-// per PUT (envelope v1) and wraps it under the supplied key.
-//
-// The bearer is the user's api_key — buckets resolves it to the owning
-// (user_id, org_id) and uses that as the R2 storage prefix.
+// Puts plaintext snapshot to tinfoil-buckets, where it is encrypted
 func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
 	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
@@ -126,18 +115,8 @@ func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeE
 }
 
 // pushRestore POSTs the plaintext tar to the container's /restore endpoint.
-// This only succeeds during the startup window — the executor's api-server
-// closes the gate after the first non-/restore call, so we MUST call this
-// before any user traffic touches the container.
-//
-// Body shape matches executor/snapshot.go's restoreRequest: {tar: <base64>}.
-// The api-server token gate also gets its first claim from this call when
-// there's a snapshot to restore; on a 403 the recordContainerStatus path
-// counts toward the consecutive-403s threshold like any other call.
-//
-// Returns (status, err). status is 0 when the request never produced an
-// HTTP response (transport-level failure). The caller uses status to
-// decide whether a retry is worth attempting — 4xx isn't, 5xx and 0 are.
+// MUST be called this before any user traffic touches the container (while it's still in warm lifecycle)
+// On a 403 the recordContainerStatus path counts toward the consecutive-403s threshold like any other call.
 func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []byte) (int, error) {
 	if c.httpClient == nil {
 		return 0, fmt.Errorf("no http client for container %s", c.Name)
@@ -167,10 +146,7 @@ func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []b
 	return resp.StatusCode, nil
 }
 
-// fetchSnapshotFromContainer asks the running container for a streaming plaintext
-// tar of /workspace. Used on eviction. Encryption is handled by buckets,
-// not the container, so the container response is just {tar: <base64>}.
-//
+// Asks the running container for a streaming plaintexttar of /workspace.
 // A clean stream is signaled by the X-Snapshot-Status: ok HTTP trailer.
 // A 200 with the trailer absent or != "ok" means there was a problem
 func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) ([]byte, error) {
