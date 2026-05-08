@@ -109,20 +109,28 @@ Tools: bash, view, present, str_replace, create, insert
 Other endpoints:
 
 ```
-GET /metrics — full container details (used by viz.py)
+GET /metrics — Prometheus scrape endpoint
 ```
+
+Counters: `orchestrator_containers_created_total`,
+`..._deleted_total`, `..._snapshots_total{result}`, `..._restores_total{result}`,
+`..._health_failures_total{kind}`, `..._attestation_failures_total`,
+`..._controlplane_errors_total`. Gauges: `..._warm_pool_size`,
+`..._inflight_size`, `..._sessions_active`, `..._pool_target`,
+`..._max_containers`.
 
 On `SIGINT`/`SIGTERM` the manager snapshots every active session to
 buckets, deletes every container it owns on controlplane, then exits —
 so a deploy or local `ctrl-c` doesn't leak containers or session state.
 
-### Visualizer
+### Local visualizer
 
 ```bash
-python viz.py
+./viz.sh                    # default: http://localhost:7070
+./viz.sh http://host:port   # custom URL
 ```
 
-Polls `/metrics` every second. Shows warm pool (green), inflight (yellow), active sessions (cyan), and failures (red).
+Wraps `watch -n 1 'curl -s URL/metrics | grep orchestrator_'`.
 
 ## Environment Container
 

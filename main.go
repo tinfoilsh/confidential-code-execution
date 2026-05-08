@@ -3,7 +3,7 @@
 // Thin HTTP server that routes:
 //
 //	POST /mcp     → MCP handler (primary tool interface)
-//	GET  /metrics → metrics showing the container status, load, etc.
+//	GET  /metrics → Prometheus scrape (aggregate counters/gauges only)
 //
 // On SIGINT/SIGTERM the orchestrator snapshots every active session to
 // buckets & deletes every container it owns
@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func envStr(key, def string) string {
@@ -81,6 +83,7 @@ func main() {
 		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.DevSkipAttestation)
 	log.Printf("environment container: repo=%s tag=%s", cfg.EnvironmentRepo, cfg.EnvironmentTag)
 	mgr := NewManager(cfg)
+	registerPoolGauges(mgr)
 	mgr.StartPoolManager()
 	mgr.StartEvictionLoop()
 	mgr.StartHealthCheckLoop()
@@ -88,9 +91,7 @@ func main() {
 	mux := http.NewServeMux()
 	srv := &http.Server{Addr: ":" + strconv.Itoa(port), Handler: mux}
 
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.MetricsInfo())
-	})
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
 		var req jsonRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

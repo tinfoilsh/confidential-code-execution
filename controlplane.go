@@ -50,10 +50,14 @@ func (cp *Controlplane) do(ctx context.Context, method, path string, body any) (
 
 	resp, err := cp.httpClient.Do(req)
 	if err != nil {
+		controlplaneErrors.Inc()
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 500 {
+		controlplaneErrors.Inc()
+	}
 	if resp.StatusCode >= 400 {
 		log.Printf("orchestrator: API error %d %s %s", resp.StatusCode, method, path)
 	}
@@ -87,6 +91,7 @@ func (cp *Controlplane) createContainer(repo, tag string) (*Container, error) {
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil, err
 	}
+	containersCreated.Inc()
 	return &Container{
 		ID:        resp.ID,
 		Name:      name,
@@ -109,6 +114,7 @@ func (cp *Controlplane) pollContainer(id string) string {
 }
 
 func (cp *Controlplane) deleteContainer(id string) {
+	containersDeleted.Inc()
 	cp.do(context.Background(), "DELETE", "/api/containers/"+id, nil)
 }
 
