@@ -15,23 +15,36 @@ var restorePushRetryDelay = 1 * time.Second
 var toolCallTimeout = 35 * time.Second
 
 type Container struct {
-	ID         string
-	Name       string
-	Domain     string
-	Status     string
-	CreatedAt  time.Time
-	AssignedAt time.Time
+	// Not mutated
+	ID        string
+	Name      string
+	Domain    string
+	CreatedAt time.Time
+	// httpClient set before publishing to warmPool — no concurrent reader yet.
 	httpClient *http.Client
 
-	// Cached from the request's X-Code-Execution-Encryption-Key for buckets
-	CodeExecutionEncryptionKey string
-	// api_key from the request's Authorization header, cached for buckets
-	Bearer string
+	// mu guards every field below.
+	// Lock ordering: Manager.mu before Container.mu when both are held.
+	mu                         sync.Mutex
+	Status                     string
+	AssignedAt                 time.Time
+	LastActivity               time.Time
+	Bearer                     string // api_key from the request's Authorization header
+	CodeExecutionEncryptionKey string // X-Code-Execution-Encryption-Key from request
+	Consecutive403s            int
+	HealthFailures             int
+}
 
-	// Environment container health
-	LastActivity    time.Time
-	Consecutive403s int
-	HealthFailures  int
+func (c *Container) setStatus(s string) {
+	c.mu.Lock()
+	c.Status = s
+	c.mu.Unlock()
+}
+
+func (c *Container) bumpActivity() {
+	c.mu.Lock()
+	c.LastActivity = time.Now()
+	c.mu.Unlock()
 }
 
 type ManagerConfig struct {
@@ -169,8 +182,9 @@ func (m *Manager) pollInflight() {
 				failed = append(failed, c)
 				continue
 			}
+			// httpClient set before publishing to warmPool — no concurrent reader yet.
 			c.httpClient = cli
-			c.Status = "ready"
+			c.setStatus("ready")
 			ready = append(ready, c)
 		case "failed":
 			failed = append(failed, c)
@@ -188,12 +202,14 @@ func (m *Manager) pollInflight() {
 	}
 	for _, c := range failed {
 		m.removeFromInflight(c)
-		c.Status = "failed"
 	}
 	if len(ready) > 0 {
 		m.cond.Broadcast()
 	}
 	m.mu.Unlock()
+	for _, c := range failed {
+		c.setStatus("failed")
+	}
 
 	for _, c := range failed {
 		go m.cp.deleteContainer(c.ID)
@@ -277,26 +293,28 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 
 	codeExecutionEncryptionKey := sessionCodeExecutionEncryptionKey(ctx)
 	bearer := sessionBearer(ctx)
+	var c *Container
 
 	m.mu.Lock()
-	if c, ok := m.sessions[accessToken]; ok {
+	c, ok := m.sessions[accessToken]
+	if !ok && len(m.sessions) >= m.cfg.MaxContainers {
+		m.mu.Unlock()
+		return nil, fmt.Sprintf("at capacity (%d sessions)", m.cfg.MaxContainers)
+	}
+	m.mu.Unlock()
+	if ok {
+		c.mu.Lock()
 		if codeExecutionEncryptionKey != "" {
 			c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
 		}
 		if bearer != "" {
 			c.Bearer = bearer
 		}
-		m.mu.Unlock()
+		c.mu.Unlock()
 		return c, ""
 	}
-	if len(m.sessions) >= m.cfg.MaxContainers {
-		m.mu.Unlock()
-		return nil, fmt.Sprintf("at capacity (%d sessions)", m.cfg.MaxContainers)
-	}
-	m.mu.Unlock()
 
 	deadline := time.Now().Add(m.cfg.WarmPoolWaitTimeout)
-	var c *Container
 	for {
 		m.mu.Lock()
 		for len(m.warmPool) == 0 {
@@ -323,21 +341,22 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 			c = candidate
 			break
 		}
-		candidate.Status = "failed"
+		candidate.setStatus("failed")
 		go m.cp.deleteContainer(candidate.ID)
 	}
 
-	m.mu.Lock()
+	now := time.Now()
+	c.mu.Lock()
 	c.Status = "assigning"
-	c.AssignedAt = time.Now()
-	c.LastActivity = time.Now()
+	c.AssignedAt = now
+	c.LastActivity = now
 	if codeExecutionEncryptionKey != "" {
 		c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
 	}
 	if bearer != "" {
 		c.Bearer = bearer
 	}
-	m.mu.Unlock()
+	c.mu.Unlock()
 
 	// Restore failures fall through to a fresh empty workspace — better
 	// than refusing to assign and breaking the user's chat.
@@ -347,8 +366,8 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 
 	// Mark assigned only AFTER restore so the eviction loop can't trip
 	// on a half-bootstrapped container.
+	c.setStatus("assigned")
 	m.mu.Lock()
-	c.Status = "assigned"
 	m.sessions[accessToken] = c
 	m.mu.Unlock()
 
@@ -394,7 +413,7 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 	if !ok {
 		return nil
 	}
-	c.Status = "deleting"
+	c.setStatus("deleting")
 	go m.cp.deleteContainer(c.ID)
 	return c
 }
@@ -403,8 +422,12 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 // cached) then deletes the container. Snapshot failures still destroy:
 // losing state is bad, leaving stale containers is worse.
 func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
+	c.mu.Lock()
+	bearer, key := c.Bearer, c.CodeExecutionEncryptionKey
+	c.mu.Unlock()
+
 	switch {
-	case c.CodeExecutionEncryptionKey == "", c.Bearer == "":
+	case key == "", bearer == "":
 		snapshots.WithLabelValues("skipped").Inc()
 	default:
 		ctx := context.Background()
@@ -414,10 +437,10 @@ func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 		} else {
 			// One retry on transient PUT failure: a single buckets blip
 			// shouldn't cost a user their workspace.
-			putErr := m.buckets.put(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
+			putErr := m.buckets.put(ctx, bearer, accessToken, key, tarBytes)
 			if putErr != nil {
 				time.Sleep(snapshotPutRetryDelay)
-				putErr = m.buckets.put(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
+				putErr = m.buckets.put(ctx, bearer, accessToken, key, tarBytes)
 			}
 			if putErr != nil {
 				snapshots.WithLabelValues("failure").Inc()
@@ -426,7 +449,7 @@ func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 			}
 		}
 	}
-	c.Status = "deleting"
+	c.setStatus("deleting")
 	m.cp.deleteContainer(c.ID)
 }
 
@@ -454,7 +477,10 @@ func (m *Manager) evictIdleSessions() {
 
 	m.mu.Lock()
 	for sid, c := range m.sessions {
-		if now.Sub(c.LastActivity) >= m.cfg.IdleTimeout {
+		c.mu.Lock()
+		idle := now.Sub(c.LastActivity) >= m.cfg.IdleTimeout
+		c.mu.Unlock()
+		if idle {
 			targets = append(targets, target{sid, c})
 		}
 	}
@@ -514,15 +540,15 @@ func (m *Manager) healthCheckLoop() {
 // label ("warm" / "session")
 func (m *Manager) shouldEvictForHealth(c *Container, label string) bool {
 	if m.checkContainerHealth(c) {
-		m.mu.Lock()
+		c.mu.Lock()
 		c.HealthFailures = 0
-		m.mu.Unlock()
+		c.mu.Unlock()
 		return false
 	}
-	m.mu.Lock()
+	c.mu.Lock()
 	c.HealthFailures++
 	n := c.HealthFailures
-	m.mu.Unlock()
+	c.mu.Unlock()
 	if n < m.cfg.MaxHealthFailures {
 		return false
 	}
@@ -548,11 +574,9 @@ func (m *Manager) scanWarmHealth() {
 				break
 			}
 		}
-		if evicted {
-			c.Status = "failed"
-		}
 		m.mu.Unlock()
 		if evicted {
+			c.setStatus("failed")
 			go m.cp.deleteContainer(c.ID)
 		}
 	}

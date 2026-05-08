@@ -53,7 +53,7 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 	defer resp.Body.Close()
 	data, readErr := readLimited(resp.Body, maxExecutorBody)
 	// Bump activity even on non-2xx — the user is still interacting.
-	c.LastActivity = time.Now()
+	c.bumpActivity()
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	if readErr != nil {
 		return resp.StatusCode, nil, readErr
@@ -68,18 +68,18 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 // session. Non-403 4xx/5xx are ignored: not evidence of token mismatch.
 func (m *Manager) recordContainerStatus(accessToken string, c *Container, status int) {
 	if status >= 200 && status < 300 {
-		m.mu.Lock()
+		c.mu.Lock()
 		c.Consecutive403s = 0
-		m.mu.Unlock()
+		c.mu.Unlock()
 		return
 	}
 	if status != http.StatusForbidden {
 		return
 	}
-	m.mu.Lock()
+	c.mu.Lock()
 	c.Consecutive403s++
 	n := c.Consecutive403s
-	m.mu.Unlock()
+	c.mu.Unlock()
 	if n >= 2 {
 		log.Printf("orchestrator: container %s rejected the session's access token twice — destroying", c.Name)
 		m.CleanupSession(accessToken)
