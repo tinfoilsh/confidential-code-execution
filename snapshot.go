@@ -74,7 +74,7 @@ func (b *Buckets) fetch(ctx context.Context, bearer, accessToken, codeExecutionE
 		return nil, nil
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("buckets GET %s: %d %s", accessToken, resp.StatusCode, string(raw))
+		return nil, fmt.Errorf("buckets GET: %d", resp.StatusCode)
 	}
 
 	var body struct {
@@ -116,9 +116,8 @@ func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEnc
 		return err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("buckets PUT %s: %d %s", accessToken, resp.StatusCode, string(raw))
+		return fmt.Errorf("buckets PUT: %d", resp.StatusCode)
 	}
 	return nil
 }

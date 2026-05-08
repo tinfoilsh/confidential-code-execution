@@ -320,7 +320,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 			}
 			if isConnected != nil && !isConnected() {
 				m.mu.Unlock()
-				log.Printf("orchestrator: client disconnected while waiting for session %s", accessToken)
+				log.Printf("orchestrator: client disconnected while waiting for session")
 				return nil, "client disconnected"
 			}
 			// wake every 2s to re-check connection / deadline
@@ -359,10 +359,9 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	// than refusing to assign and breaking the user's chat.
 	if codeExecutionEncryptionKey != "" && bearer != "" {
 		if err := m.restoreInto(ctx, bearer, accessToken, c, codeExecutionEncryptionKey); err != nil {
-			log.Printf("orchestrator: restore failed for session %s on %s: %v (continuing with empty workspace)",
-				accessToken, c.Name, err)
+			log.Printf("orchestrator: restore failed on %s: %v (continuing with empty workspace)", c.Name, err)
 		} else {
-			log.Printf("orchestrator: restore complete for session %s on %s", accessToken, c.Name)
+			log.Printf("orchestrator: restore complete on %s", c.Name)
 		}
 	}
 
@@ -373,7 +372,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	m.sessions[accessToken] = c
 	m.mu.Unlock()
 
-	log.Printf("orchestrator: assigned %s to session %s", c.Name, accessToken)
+	log.Printf("orchestrator: assigned %s to a session", c.Name)
 	return c, ""
 }
 
@@ -392,7 +391,7 @@ func (m *Manager) restoreInto(ctx context.Context, bearer, accessToken string, c
 	// mismatch, 410 window closed) won't recover — bail.
 	status, err := m.pushRestore(c, accessToken, tarBytes)
 	if err != nil && (status == 0 || status >= 500) {
-		log.Printf("orchestrator: pushRestore transient failure for session %s: %v — retrying once", accessToken, err)
+		log.Printf("orchestrator: pushRestore transient failure: %v — retrying once", err)
 		time.Sleep(restorePushRetryDelay)
 		_, err = m.pushRestore(c, accessToken, tarBytes)
 	}
@@ -414,7 +413,7 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 		return nil
 	}
 	c.Status = "deleting"
-	log.Printf("orchestrator: cleaning up %s for session %s", c.Name, accessToken)
+	log.Printf("orchestrator: cleaning up session container %s", c.Name)
 	go m.cp.deleteContainer(c.ID)
 	return c
 }
@@ -425,27 +424,27 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 	switch {
 	case c.CodeExecutionEncryptionKey == "":
-		log.Printf("orchestrator: no code execution encryption key cached for session %s — skipping snapshot", accessToken)
+		log.Printf("orchestrator: no code execution encryption key cached for session — skipping snapshot")
 	case c.Bearer == "":
-		log.Printf("orchestrator: no api_key bearer cached for session %s — skipping snapshot", accessToken)
+		log.Printf("orchestrator: no api_key bearer cached for session — skipping snapshot")
 	default:
 		ctx := context.Background()
 		tarBytes, err := m.fetchSnapshotFromContainer(c, accessToken)
 		if err != nil {
-			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", accessToken, c.Name, err)
+			log.Printf("orchestrator: snapshot failed on %s: %v", c.Name, err)
 		} else {
 			// One retry on transient PUT failure: a single buckets blip
 			// shouldn't cost a user their workspace.
 			putErr := m.buckets.put(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			if putErr != nil {
-				log.Printf("orchestrator: PUT snapshot failed for session %s: %v — retrying once", accessToken, putErr)
+				log.Printf("orchestrator: PUT snapshot failed: %v — retrying once", putErr)
 				time.Sleep(snapshotPutRetryDelay)
 				putErr = m.buckets.put(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			}
 			if putErr != nil {
-				log.Printf("orchestrator: PUT snapshot failed for session %s after retry: %v", accessToken, putErr)
+				log.Printf("orchestrator: PUT snapshot failed after retry: %v", putErr)
 			} else {
-				log.Printf("orchestrator: snapshotted session %s (container %s) to buckets", accessToken, c.Name)
+				log.Printf("orchestrator: snapshotted container %s to buckets", c.Name)
 			}
 		}
 	}
@@ -489,8 +488,7 @@ func (m *Manager) evictIdleSessions() {
 	m.mu.Unlock()
 
 	for _, t := range targets {
-		log.Printf("orchestrator: idle-evicting session %s on %s (idle ~%v)",
-			t.accessToken, t.c.Name, m.cfg.IdleTimeout)
+		log.Printf("orchestrator: idle-evicting session on %s (idle ~%v)", t.c.Name, m.cfg.IdleTimeout)
 		m.evictAndSnapshot(t.accessToken, t.c)
 		m.mu.Lock()
 		delete(m.assignLocks, t.accessToken)
@@ -622,8 +620,8 @@ func (m *Manager) scanSessionHealth() {
 		delete(m.sessions, t.accessToken)
 		m.mu.Unlock()
 
-		log.Printf("orchestrator: session %s on %s exceeded health failure threshold (%d) — snapshotting + destroying",
-			t.accessToken, t.c.Name, m.cfg.MaxHealthFailures)
+		log.Printf("orchestrator: session on %s exceeded health failure threshold (%d) — snapshotting + destroying",
+			t.c.Name, m.cfg.MaxHealthFailures)
 		go func(accessToken string, c *Container) {
 			m.evictAndSnapshot(accessToken, c)
 			m.mu.Lock()
@@ -721,15 +719,14 @@ func (m *Manager) MetricsInfo() map[string]any {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	rec := func(c *Container, accessToken string) map[string]any {
+	rec := func(c *Container, isSession bool) map[string]any {
 		d := map[string]any{
 			"id":     c.ID,
 			"name":   c.Name,
 			"status": c.Status,
 			"uptime": int(now.Sub(c.CreatedAt).Seconds()),
 		}
-		if accessToken != "" {
-			d["code_execution_access_token"] = accessToken
+		if isSession {
 			active := 0
 			if !c.AssignedAt.IsZero() {
 				active = int(now.Sub(c.AssignedAt).Seconds())
@@ -741,19 +738,19 @@ func (m *Manager) MetricsInfo() map[string]any {
 
 	warm := []map[string]any{}
 	for _, c := range m.warmPool {
-		warm = append(warm, rec(c, ""))
+		warm = append(warm, rec(c, false))
 	}
 	inflight := []map[string]any{}
 	for _, c := range m.inflight {
-		inflight = append(inflight, rec(c, ""))
+		inflight = append(inflight, rec(c, false))
 	}
 	sessions := []map[string]any{}
-	for sid, c := range m.sessions {
-		sessions = append(sessions, rec(c, sid))
+	for _, c := range m.sessions {
+		sessions = append(sessions, rec(c, true))
 	}
 	failed := []map[string]any{}
 	for _, c := range m.failed {
-		failed = append(failed, rec(c, ""))
+		failed = append(failed, rec(c, false))
 	}
 
 	return map[string]any{

@@ -118,9 +118,9 @@ def _layout_boxes(
             label = c["name"]
             sub = f"{c['id'][:8]}  {fmt_uptime(c['uptime'])}"
             extra = ""
-            if show_session and c.get("code_execution_access_token"):
+            if show_session and "active_time" in c:
                 active = c.get("active_time", 0)
-                sub = f"tok:{c['code_execution_access_token'][:12]}  active {fmt_uptime(active)}"
+                sub = f"{c['id'][:8]}  active {fmt_uptime(active)}"
             rendered.append(box(label, sub, bg, box_width, extra))
 
         # zip the lines of each box together (may be 3 or 4 lines)

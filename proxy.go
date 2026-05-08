@@ -80,7 +80,7 @@ func (m *Manager) recordContainerStatus(accessToken string, c *Container, status
 	n := c.Consecutive403s
 	m.mu.Unlock()
 	if n >= 2 {
-		log.Printf("orchestrator: container %s rejected access token for session %s twice — destroying", c.Name, accessToken)
+		log.Printf("orchestrator: container %s rejected the session's access token twice — destroying", c.Name)
 		m.CleanupSession(accessToken)
 	}
 }

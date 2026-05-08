@@ -55,7 +55,7 @@ func (cp *Controlplane) do(ctx context.Context, method, path string, body any) (
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		log.Printf("orchestrator: API error %d %s %s: %s", resp.StatusCode, method, path, data)
+		log.Printf("orchestrator: API error %d %s %s", resp.StatusCode, method, path)
 	}
 	return resp.StatusCode, data, nil
 }
