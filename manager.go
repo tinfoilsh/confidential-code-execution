@@ -89,7 +89,8 @@ type ManagerConfig struct {
 	PollInterval      time.Duration
 	EnvironmentRepo   string
 	EnvironmentTag    string
-	VerifyAttestation bool
+	// DevSkipAttestation skips enclave attestation. Local dev only.
+	DevSkipAttestation bool
 	// DevBypassAuth skips api_key validation. Local dev only.
 	DevBypassAuth bool
 	// IdleTimeout is how long a session can have no tool activity before
@@ -292,16 +293,11 @@ func (m *Manager) verifyContainerName(c *Container) bool {
 // ---------------------------------------------------------------------------
 
 func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
-	// TODO: flip VERIFY_ATTESTATION to true in prod alongside the snapshot
-	// feature. Default stays false here so local/dev still work without
-	// enclave attestation, but the chained-attestation trust model
-	// (webapp -> router -> orchestrator -> container) requires this on
-	// in production for the resume handshake to be meaningful.
 	// 90s ceiling on the container client covers snapshot/restore bulk
 	// transfers at the /workspace tmpfs ceiling. /exec, /read, /write
 	// hold to the tighter toolCallTimeout (35s) via per-request context,
 	// so a runaway tool call can't tie up a session for the full 90s.
-	if !m.cfg.VerifyAttestation {
+	if m.cfg.DevSkipAttestation {
 		log.Printf("orchestrator: skipping attestation for %s (%s)", c.Name, c.Domain)
 		return &http.Client{Timeout: 90 * time.Second}, nil
 	}

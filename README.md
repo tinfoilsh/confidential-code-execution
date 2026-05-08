@@ -33,7 +33,7 @@ go build .
 | `ENVIRONMENT_TAG`  | `v0.0.9`                               | Image tag to deploy                |
 
 |  
-| `VERIFY_ATTESTATION` | `false` | Verify enclave attestation + pin TLS public key. |
+| `DEV_SKIP_ATTESTATION` | `false` | Local dev only — skip enclave attestation + TLS pinning. Never set in prod. |
 | `DEV_BYPASS_AUTH` | `false` | Local dev only — skip api_key validation. Never set in prod. |
 | `HEALTH_CHECK_INTERVAL` | `15` | Seconds between `/health` probes of warm containers. |
 | `MAX_HEALTH_FAILURES` | `3` | Consecutive `/health` failures before a warm container is destroyed and replaced. |

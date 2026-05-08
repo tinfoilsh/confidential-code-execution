@@ -62,13 +62,15 @@ func main() {
 		PoolSize:            envInt("POOL_SIZE", 3),
 		MaxContainers:       envInt("MAX_CONTAINERS", 10),
 		PollInterval:        time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
-		EnvironmentRepo:     envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
-		EnvironmentTag:      envStr("ENVIRONMENT_TAG", "v0.0.9"),
-		VerifyAttestation:   envBool("VERIFY_ATTESTATION", false),
-		DevBypassAuth:       envBool("DEV_BYPASS_AUTH", false),
 		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
 		HealthCheckInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 15)) * time.Second,
 		MaxHealthFailures:   envInt("MAX_HEALTH_FAILURES", 3),
+
+		EnvironmentRepo: envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
+		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.9"),
+
+		DevSkipAttestation: envBool("DEV_SKIP_ATTESTATION", false),
+		DevBypassAuth:      envBool("DEV_BYPASS_AUTH", false),
 	}
 
 	// Snapshot storage lives at tinfoil-buckets. Default points at prod;
@@ -76,9 +78,9 @@ func main() {
 	bucketsBase = envStr("BUCKETS_BASE", bucketsBase)
 	port := envInt("PORT", 7070)
 
-	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v verify_attestation=%v",
-		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.VerifyAttestation)
-	log.Printf("orchestrator: repo=%s tag=%s", cfg.EnvironmentRepo, cfg.EnvironmentTag)
+	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v dev_skip_attestation=%v",
+		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.DevSkipAttestation)
+	log.Printf("environment container: repo=%s tag=%s", cfg.EnvironmentRepo, cfg.EnvironmentTag)
 	mgr := NewManager(cfg)
 	mgr.StartPoolManager()
 	mgr.StartEvictionLoop()
