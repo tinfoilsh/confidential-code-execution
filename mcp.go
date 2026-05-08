@@ -27,12 +27,6 @@ type rpcError struct {
 
 // HandleMCPRequest processes a JSON-RPC 2.0 MCP request.
 // Returns (status, response). If response is nil, the request was a notification.
-//
-// ctx is the per-request context — pass r.Context() from the HTTP handler.
-// The user's symmetric Code Execution Encryption Key is stamped onto a
-// child context via WithCodeExecutionEncryptionKey and read back at the
-// GetOrAssign call site, so it lives exactly as long as the request
-// goroutine.
 func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req jsonRPCRequest) (int, *jsonRPCResponse) {
 	// Notifications have no id
 	if req.ID == nil {
@@ -72,15 +66,8 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32603, Message: "auth check failed: " + err.Error()}
 			return http.StatusInternalServerError, resp
 		}
-		// Stash the Code Execution Encryption Key on ctx. GetOrAssign reads
-		// it back to (a) cache it on c.CodeExecutionEncryptionKey for
-		// eviction-time encryption via buckets, and (b) drive the
-		// restore-on-assign fetch from buckets before the fresh container
-		// is exposed to traffic.
+		// Stash the keys on the ctx. They are used by the manager
 		ctx = WithCodeExecutionEncryptionKey(ctx, headers.Get("X-Code-Execution-Encryption-Key"))
-		// Stash the bearer too so GetOrAssign can cache it on the
-		// container for buckets calls (restore-on-assign and
-		// eviction-time snapshot).
 		ctx = WithBearer(ctx, bearer)
 		name, _ := req.Params["name"].(string)
 		args, _ := req.Params["arguments"].(map[string]any)
