@@ -1,23 +1,15 @@
 package main
 
-// Orchestrator-side snapshot/restore helpers.
-//
-// The bucket service
-// handles encryption end-to-end: callers pass plaintext + a 32-byte
-// symmetric key, the bucket encrypts under the key
-// and persists ciphertext in R2. We never see ciphertext.
+// Snapshot & save a containers' filesystem.
+// The bucket service handles encryption end-to-end. We pass plaintext & accessToken & encryption key
 //
 // Flow:
 //
-//   1. on resume: GET /items/{accessToken} from buckets with the user's
+//   1. to resume a session: GET /items/{accessToken} from buckets with the user's
 //      X-Encryption-Key, get plaintext tar back, push it into the fresh
 //      container's /restore endpoint before exposing it.
-//   2. on eviction: ask the container for a plaintext tar (its /snapshot
-//      now returns plaintext — encryption is upstream), PUT it to
-//      /items/{accessToken} with the cached exec key, then destroy the
-//      container.
-//
-// The container never sees the key; the orchestrator never sees ciphertext.
+//   2. to snapshot a session: ask the container for a plaintext tar (/snapshot), PUT it to
+//      /items/{accessToken} with the cached exec key, then destroy the container.
 
 import (
 	"bytes"
@@ -31,48 +23,6 @@ import (
 
 // The HTTP trailer the environment sets to true once it's finished streaming
 const snapshotTrailer = "X-Snapshot-Status"
-
-// ctxKeyCodeExecutionEncryptionKey carries the user's symmetric Code
-// Execution Encryption Key down the call chain. The MCP boundary reads
-// X-Code-Execution-Encryption-Key from the request and stashes it here;
-// GetOrAssign and the eviction path read it back. Lifetime is bounded by
-// the request goroutine — when the handler returns, the context is gone,
-// so a stale key can't leak into a later request.
-type ctxKey int
-
-const (
-	ctxKeyCodeExecutionEncryptionKey ctxKey = iota
-	ctxKeyBearer
-)
-
-// WithCodeExecutionEncryptionKey returns a child context carrying the
-// user's Code Execution Encryption Key. Empty values are not stored.
-func WithCodeExecutionEncryptionKey(ctx context.Context, key string) context.Context {
-	if key != "" {
-		ctx = context.WithValue(ctx, ctxKeyCodeExecutionEncryptionKey, key)
-	}
-	return ctx
-}
-
-func sessionCodeExecutionEncryptionKey(ctx context.Context) string {
-	v, _ := ctx.Value(ctxKeyCodeExecutionEncryptionKey).(string)
-	return v
-}
-
-// WithBearer returns a child context carrying the api_key bearer. Empty
-// values are not stored. Read by GetOrAssign and the eviction path so
-// buckets calls can authenticate and resolve the storage prefix.
-func WithBearer(ctx context.Context, bearer string) context.Context {
-	if bearer != "" {
-		ctx = context.WithValue(ctx, ctxKeyBearer, bearer)
-	}
-	return ctx
-}
-
-func sessionBearer(ctx context.Context) string {
-	v, _ := ctx.Value(ctxKeyBearer).(string)
-	return v
-}
 
 // decodeBase64Lenient accepts std, raw-std, url, or raw-url base64.
 // Webapp headers tend to be url-safe with no padding; std-encoded values

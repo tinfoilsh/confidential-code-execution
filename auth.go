@@ -10,6 +10,40 @@ import (
 	"strings"
 )
 
+// Per-request user identity stashed on ctx by the MCP boundary.
+// Manager reads it and copies onto *Container fields, so
+// the eviction loop can use it later.
+type ctxKey int
+
+const (
+	ctxKeyCodeExecutionEncryptionKey ctxKey = iota
+	ctxKeyBearer
+)
+
+func WithCodeExecutionEncryptionKey(ctx context.Context, key string) context.Context {
+	if key != "" {
+		ctx = context.WithValue(ctx, ctxKeyCodeExecutionEncryptionKey, key)
+	}
+	return ctx
+}
+
+func sessionCodeExecutionEncryptionKey(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyCodeExecutionEncryptionKey).(string)
+	return v
+}
+
+func WithBearer(ctx context.Context, bearer string) context.Context {
+	if bearer != "" {
+		ctx = context.WithValue(ctx, ctxKeyBearer, bearer)
+	}
+	return ctx
+}
+
+func sessionBearer(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyBearer).(string)
+	return v
+}
+
 var ErrAuthRequired = errors.New("code execution requires a valid api key")
 
 // AuthorizeSession verifies the bearer is a valid api_key by calling
