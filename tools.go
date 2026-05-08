@@ -49,7 +49,7 @@ var Tools = []ToolSchema{
 		},
 	},
 	{
-		Name:        "present",
+		Name: "present",
 		Description: "Show a file to the user. The file is rendered directly in the chat as a syntax-highlighted code block, exactly as if you had pasted it inline. " +
 			"You will receive the file's contents back as the tool result so you can keep working with it, but the user has ALREADY SEEN the full file by the time this tool returns. " +
 			"After calling present, do NOT re-paste, restate, summarize, or quote the file's contents in your reply — the user is looking at it. " +
@@ -315,6 +315,8 @@ func handleInsert(ctx context.Context, m *Manager, accessToken string, args map[
 
 // ---------------------------------------------------------------------------
 // present formatting
+// present formats as a code block so we get nice styles. All other tools format as text.
+//  In the future, maybe the client should handle this & make it look nice
 // ---------------------------------------------------------------------------
 
 // extensionToLanguage maps file extensions to the language tag used in
