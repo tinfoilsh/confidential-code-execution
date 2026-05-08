@@ -1,15 +1,12 @@
 package main
 
-// Snapshot & save a containers' filesystem.
+// Snapshot & restore a container's filesystem.
 // The bucket service handles encryption end-to-end. We pass plaintext, accessToken, encryption key, api key
 //
-// Flow:
-//
-//   1. to resume a session: GET /items/{accessToken} from buckets with the user's
-//      X-Encryption-Key, get plaintext tar back, push it into the fresh
-//      container's /restore endpoint before exposing it.
-//   2. to snapshot a session: ask the container for a plaintext tar (/snapshot), PUT it to
-//      /items/{accessToken} with the cached exec key, then destroy the container.
+//   1. resume: GET /items/{accessToken} from buckets, push plaintext
+//      tar to the fresh container's /restore before user traffic hits it.
+//   2. snapshot: ask the container for a plaintext tar at /snapshot,
+//      PUT to /items/{accessToken}, then destroy the container.
 
 import (
 	"bytes"
@@ -19,14 +16,30 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
-// The HTTP trailer the environment sets to true once it's finished streaming
+// HTTP trailer the environment sets to "ok" once it's finished streaming.
 const snapshotTrailer = "X-Snapshot-Status"
 
-// urlBase64ToStd converts the webapp's url-safe-no-padding key (idiomatic
-// JS, matches the passkey/WebAuthn ecosystem) to std-base64, which is
-// what buckets expects.
+// ---------------------------------------------------------------------------
+// Buckets — HTTP client for buckets.tinfoil.sh.
+// ---------------------------------------------------------------------------
+
+type Buckets struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+func NewBuckets(baseURL string) *Buckets {
+	return &Buckets{
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: 120 * time.Second}, //
+	}
+}
+
+// urlBase64ToStd converts the webapp's url-safe-no-padding key
+// (idiomatic JS) to std-base64 — what buckets expects.
 func urlBase64ToStd(b64url string) (string, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(b64url)
 	if err != nil {
@@ -35,14 +48,14 @@ func urlBase64ToStd(b64url string) (string, error) {
 	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
-// Pulls the plaintext tar for accessToken from buckets (requires Bearer)
-// Returns (nil, nil) when on 403 or 404.
-func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
+// fetch returns the plaintext tar for accessToken. (nil, nil) on 403/404
+// — wrong key or no snapshot yet, both surface as a fresh workspace.
+func (b *Buckets) fetch(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
 	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", m.cfg.BucketsBase+"/items/"+accessToken, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", b.baseURL+"/items/"+accessToken, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -50,18 +63,14 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, cod
 	req.Header.Set("X-Encryption-Key", keyStd)
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
 
-	resp, err := m.apiClient.Do(req)
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
-	if resp.StatusCode == http.StatusForbidden {
-		// Wrong key or corrupt envelope.
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
 		return nil, nil
 	}
 	if resp.StatusCode >= 400 {
@@ -81,8 +90,8 @@ func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, cod
 	return tarBytes, nil
 }
 
-// Puts plaintext snapshot to tinfoil-buckets, where it is encrypted
-func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
+// put stores the plaintext tar; buckets encrypts it under the supplied key.
+func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
 	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return err
@@ -94,7 +103,7 @@ func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeE
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "PUT", m.cfg.BucketsBase+"/items/"+accessToken, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, "PUT", b.baseURL+"/items/"+accessToken, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -102,7 +111,7 @@ func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeE
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
 
-	resp, err := m.apiClient.Do(req)
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -114,9 +123,13 @@ func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeE
 	return nil
 }
 
-// pushRestore POSTs the plaintext tar to the container's /restore endpoint.
-// MUST be called this before any user traffic touches the container (while it's still in warm lifecycle)
-// On a 403 the recordContainerStatus path counts toward the consecutive-403s threshold like any other call.
+// ---------------------------------------------------------------------------
+// Executor /restore + /snapshot — hits the per-container attested client.
+// ---------------------------------------------------------------------------
+
+// pushRestore POSTs the plaintext tar to the container's /restore.
+// Must run before any user traffic touches the container. A 403 counts
+// toward the consecutive-403s threshold via recordContainerStatus.
 func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []byte) (int, error) {
 	if c.httpClient == nil {
 		return 0, fmt.Errorf("no http client for container %s", c.Name)
@@ -146,9 +159,9 @@ func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []b
 	return resp.StatusCode, nil
 }
 
-// Asks the running container for a streaming plaintexttar of /workspace.
-// A clean stream is signaled by the X-Snapshot-Status: ok HTTP trailer.
-// A 200 with the trailer absent or != "ok" means there was a problem
+// Streams a plaintext tar of /workspace.
+// Clean stream is signaled by the X-Snapshot-Status: ok HTTP trailer;
+// 200 with the trailer absent or != "ok" means there was a problem.
 func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) ([]byte, error) {
 	if c.httpClient == nil {
 		return nil, fmt.Errorf("no http client for container %s", c.Name)

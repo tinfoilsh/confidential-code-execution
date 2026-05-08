@@ -23,28 +23,15 @@ type Container struct {
 	AssignedAt time.Time
 	httpClient *http.Client
 
-	// User's symmetric AES-256 key (base64), cached from the request's
-	// X-Code-Execution-Encryption-Key. Used at eviction time to PUT the
-	// workspace tar to buckets. The container itself never sees this.
+	// Cached from the request's X-Code-Execution-Encryption-Key for buckets
 	CodeExecutionEncryptionKey string
-
-	// api_key from the request's Authorization header, cached as the
-	// buckets bearer for restore-on-assign and eviction-time snapshot.
-	// Refreshed every tools/call so a key rotation mid-session is picked up.
+	// api_key from the request's Authorization header, cached for buckets
 	Bearer string
 
-	LastActivity time.Time
-
-	// Back-to-back 403s from the executor's access-token gate. Two in a
-	// row means a poisoned warm-pool container or session-map drift —
-	// recordContainerStatus tears down the session at the threshold.
-	// Reset on any 2xx. Guarded by Manager.mu.
+	// Environment container health
+	LastActivity    time.Time
 	Consecutive403s int
-
-	// Back-to-back /health failures from the periodic checker. At
-	// MaxHealthFailures we destroy the container.
-	// Reset on any 200. Guarded by Manager.mu.
-	HealthFailures int
+	HealthFailures  int
 }
 
 type ManagerConfig struct {
@@ -56,21 +43,18 @@ type ManagerConfig struct {
 	PollInterval    time.Duration
 	EnvironmentRepo string
 	EnvironmentTag  string
-	// Local dev only — skip enclave attestation + TLS pinning.
-	DevSkipAttestation bool
-	// Local dev only — skip api_key validation.
-	DevBypassAuth bool
-	// IdleTimeout is how long a session can be inactive before
-	// snapshot+evict. EvictionPoll is roughly IdleTimeout/10.
+	// Session lifecycle
 	IdleTimeout         time.Duration
 	EvictionPoll        time.Duration
 	WarmPoolWaitTimeout time.Duration
 	HealthCheckInterval time.Duration
 	MaxHealthFailures   int
-	// Caps Finish's session snapshot phase before bulk-delete. Tune per
-	// platform: k8s/ECS default 30s grace fits 25s; Cloud Run/Docker
-	// default 10s needs less (or a longer grace period).
+	// Caps Finish's session snapshot phase before bulk-delete.
+	// TODO: tune this correctly
 	ShutdownDeadline time.Duration
+	// Local dev only. Skip attestation & don't require key
+	DevSkipAttestation bool
+	DevBypassAuth      bool
 }
 
 type Manager struct {
@@ -87,7 +71,8 @@ type Manager struct {
 	apiErrors    int
 	shuttingDown bool
 
-	apiClient *http.Client
+	cp      *Controlplane
+	buckets *Buckets
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
@@ -117,12 +102,10 @@ func NewManager(cfg ManagerConfig) *Manager {
 	}
 	m := &Manager{
 		cfg:         cfg,
+		cp:          NewControlplane(cfg.ControlPlaneURL, cfg.AdminAPIKey),
+		buckets:     NewBuckets(cfg.BucketsBase),
 		sessions:    map[string]*Container{},
 		assignLocks: map[string]*sync.Mutex{},
-		// 120s covers snapshot PUT/GET at the /workspace tmpfs ceiling:
-		// 512 MB plaintext → ~683 MB after base64. Container CRUD shares
-		// this client but finishes in well under a second.
-		apiClient: &http.Client{Timeout: 120 * time.Second},
 	}
 	m.cond = sync.NewCond(&m.mu)
 	return m
@@ -159,8 +142,12 @@ func (m *Manager) replenishPool() []*Container {
 
 	var created []*Container
 	for i := 0; i < needed; i++ {
-		c := m.createContainer()
-		if c == nil {
+		c, err := m.cp.createContainer(m.cfg.EnvironmentRepo, m.cfg.EnvironmentTag)
+		if err != nil {
+			log.Printf("orchestrator: %v", err)
+			m.mu.Lock()
+			m.apiErrors++
+			m.mu.Unlock()
 			break
 		}
 		log.Printf("orchestrator: created container %s (%s)", c.Name, c.ID)
@@ -181,7 +168,7 @@ func (m *Manager) pollInflight() {
 
 	var ready, failed []*Container
 	for _, c := range toPoll {
-		s := m.pollContainer(c.ID)
+		s := m.cp.pollContainer(c.ID)
 		switch s {
 		case "ready":
 			cli, err := m.buildProxyClient(c)
@@ -353,7 +340,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		}
 		log.Printf("orchestrator: warm container %s failed pre-assign /health, discarding", candidate.Name)
 		candidate.Status = "failed"
-		go m.deleteContainer(candidate.ID)
+		go m.cp.deleteContainer(candidate.ID)
 	}
 
 	m.mu.Lock()
@@ -394,7 +381,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 // pushes the plaintext tar into the container's /restore. Empty bucket
 // or unreadable-with-this-key both surface as a fresh workspace.
 func (m *Manager) restoreInto(ctx context.Context, bearer, accessToken string, c *Container, codeExecutionEncryptionKeyB64 string) error {
-	tarBytes, err := m.fetchSnapshotTar(ctx, bearer, accessToken, codeExecutionEncryptionKeyB64)
+	tarBytes, err := m.buckets.fetch(ctx, bearer, accessToken, codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return fmt.Errorf("fetch snapshot: %w", err)
 	}
@@ -428,7 +415,7 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 	}
 	c.Status = "deleting"
 	log.Printf("orchestrator: cleaning up %s for session %s", c.Name, accessToken)
-	go m.deleteContainer(c.ID)
+	go m.cp.deleteContainer(c.ID)
 	return c
 }
 
@@ -449,11 +436,11 @@ func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 		} else {
 			// One retry on transient PUT failure: a single buckets blip
 			// shouldn't cost a user their workspace.
-			putErr := m.putSnapshotTar(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
+			putErr := m.buckets.put(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			if putErr != nil {
 				log.Printf("orchestrator: PUT snapshot failed for session %s: %v — retrying once", accessToken, putErr)
 				time.Sleep(snapshotPutRetryDelay)
-				putErr = m.putSnapshotTar(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
+				putErr = m.buckets.put(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			}
 			if putErr != nil {
 				log.Printf("orchestrator: PUT snapshot failed for session %s after retry: %v", accessToken, putErr)
@@ -463,7 +450,7 @@ func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 		}
 	}
 	c.Status = "deleting"
-	m.deleteContainer(c.ID)
+	m.cp.deleteContainer(c.ID)
 }
 
 func (m *Manager) StartEvictionLoop() {
@@ -599,7 +586,7 @@ func (m *Manager) scanWarmHealth() {
 		if evicted {
 			log.Printf("orchestrator: warm container %s exceeded health failure threshold (%d) — destroying",
 				c.Name, m.cfg.MaxHealthFailures)
-			go m.deleteContainer(c.ID)
+			go m.cp.deleteContainer(c.ID)
 		}
 	}
 }
@@ -667,12 +654,12 @@ func (m *Manager) CleanupAll() map[string]any {
 	deleted := []string{}
 	skipped := []map[string]string{}
 	for _, c := range all {
-		if !m.verifyContainerName(c) {
+		if !m.cp.verifyContainerName(c) {
 			skipped = append(skipped, map[string]string{"name": c.Name, "id": c.ID, "reason": "verification failed"})
 			continue
 		}
 		log.Printf("orchestrator: deleting %s (%s) — verified", c.Name, c.ID)
-		m.deleteContainer(c.ID)
+		m.cp.deleteContainer(c.ID)
 		deleted = append(deleted, c.Name)
 	}
 	return map[string]any{"deleted": deleted, "skipped": skipped, "count": len(deleted)}

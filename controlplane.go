@@ -1,23 +1,37 @@
 package main
 
-// container CRUD + status polling.
+// HTTP client for api.tinfoil.sh: container CRUD + api_key validation.
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
-func (m *Manager) apiRequest(method, path string, body any) (int, []byte, error) {
-	return m.apiRequestWithHeaders(method, path, body, nil)
+type Controlplane struct {
+	baseURL    string
+	adminKey   string
+	httpClient *http.Client
 }
 
-func (m *Manager) apiRequestWithHeaders(method, path string, body any, extra map[string]string) (int, []byte, error) {
+func NewControlplane(baseURL, adminKey string) *Controlplane {
+	return &Controlplane{
+		baseURL:    baseURL,
+		adminKey:   adminKey,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+func (cp *Controlplane) do(ctx context.Context, method, path string, body any) (int, []byte, error) {
 	var buf io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -26,18 +40,15 @@ func (m *Manager) apiRequestWithHeaders(method, path string, body any, extra map
 		}
 		buf = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, m.cfg.ControlPlaneURL+path, buf)
+	req, err := http.NewRequestWithContext(ctx, method, cp.baseURL+path, buf)
 	if err != nil {
 		return 0, nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+m.cfg.AdminAPIKey)
+	req.Header.Set("Authorization", "Bearer "+cp.adminKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
-	for k, v := range extra {
-		req.Header.Set(k, v)
-	}
 
-	resp, err := m.apiClient.Do(req)
+	resp, err := cp.httpClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -49,31 +60,32 @@ func (m *Manager) apiRequestWithHeaders(method, path string, body any, extra map
 	return resp.StatusCode, data, nil
 }
 
-func (m *Manager) createContainer() *Container {
+// createContainer requests a new container and returns it with
+// Status="deploying". Caller polls until "ready".
+func (cp *Controlplane) createContainer(repo, tag string) (*Container, error) {
 	suffix := make([]byte, 4)
 	if _, err := rand.Read(suffix); err != nil {
-		return nil
+		return nil, err
 	}
 	name := "daniel-exec-" + hex.EncodeToString(suffix)
 	body := map[string]any{
 		"name": name,
-		"repo": m.cfg.EnvironmentRepo,
-		"tag":  m.cfg.EnvironmentTag,
+		"repo": repo,
+		"tag":  tag,
 	}
-	status, raw, err := m.apiRequest("POST", "/api/containers", body)
-	if err != nil || status != 201 {
-		log.Printf("orchestrator: failed to create container %s: %d %v", name, status, err)
-		m.mu.Lock()
-		m.apiErrors++
-		m.mu.Unlock()
-		return nil
+	status, raw, err := cp.do(context.Background(), "POST", "/api/containers", body)
+	if err != nil {
+		return nil, fmt.Errorf("create container %s: %w", name, err)
+	}
+	if status != 201 {
+		return nil, fmt.Errorf("create container %s: status %d", name, status)
 	}
 	var resp struct {
 		ID     string `json:"id"`
 		Domain string `json:"domain"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil
+		return nil, err
 	}
 	return &Container{
 		ID:        resp.ID,
@@ -81,11 +93,11 @@ func (m *Manager) createContainer() *Container {
 		Domain:    resp.Domain,
 		Status:    "deploying",
 		CreatedAt: time.Now(),
-	}
+	}, nil
 }
 
-func (m *Manager) pollContainer(id string) string {
-	status, raw, err := m.apiRequest("GET", "/api/containers/"+id, nil)
+func (cp *Controlplane) pollContainer(id string) string {
+	status, raw, err := cp.do(context.Background(), "GET", "/api/containers/"+id, nil)
 	if err != nil || status != 200 {
 		return ""
 	}
@@ -96,14 +108,14 @@ func (m *Manager) pollContainer(id string) string {
 	return resp.Status
 }
 
-func (m *Manager) deleteContainer(id string) {
-	m.apiRequest("DELETE", "/api/containers/"+id, nil)
+func (cp *Controlplane) deleteContainer(id string) {
+	cp.do(context.Background(), "DELETE", "/api/containers/"+id, nil)
 }
 
 // verifyContainerName guards CleanupAll against deleting a container
 // whose ID has been reused under a different name on the controlplane.
-func (m *Manager) verifyContainerName(c *Container) bool {
-	status, raw, err := m.apiRequest("GET", "/api/containers/"+c.ID, nil)
+func (cp *Controlplane) verifyContainerName(c *Container) bool {
+	status, raw, err := cp.do(context.Background(), "GET", "/api/containers/"+c.ID, nil)
 	if err != nil || status != 200 {
 		log.Printf("orchestrator: skip delete %s (%s) — not found on controlplane (%d)", c.Name, c.ID, status)
 		return false
@@ -117,4 +129,103 @@ func (m *Manager) verifyContainerName(c *Container) bool {
 		return false
 	}
 	return true
+}
+
+func (cp *Controlplane) validateKey(ctx context.Context, apiKey string) (int, error) {
+	body, err := json.Marshal(map[string]string{"api_key": apiKey})
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", cp.baseURL+"/api/shim/validate-key", bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
+
+	resp, err := cp.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("controlplane validate-key: %w", err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+var ErrAuthRequired = errors.New("code execution requires a valid api key")
+
+// AuthorizeSession verifies the bearer is a valid api_key.
+//
+//   - nil               on a valid api_key (200)
+//   - ErrAuthRequired   when bearer is empty or controlplane refuses
+//   - other err         on transport / unexpected upstream status
+func (m *Manager) AuthorizeSession(ctx context.Context, bearer string) error {
+	if m.cfg.DevBypassAuth {
+		return nil
+	}
+	if bearer == "" {
+		return ErrAuthRequired
+	}
+	status, err := m.cp.validateKey(ctx, bearer)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case http.StatusOK:
+		return nil
+	// common controlplane rejections — 401, 402, 403, 429
+	case http.StatusUnauthorized,
+		http.StatusPaymentRequired,
+		http.StatusForbidden,
+		http.StatusTooManyRequests:
+		return ErrAuthRequired
+	default:
+		return fmt.Errorf("controlplane validate-key: status %d", status)
+	}
+}
+
+func extractBearer(authHeader string) string {
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return ""
+	}
+	return strings.TrimPrefix(authHeader, "Bearer ")
+}
+
+// ---------------------------------------------------------------------------
+// User identity
+// stashed on ctx by mcp.go, read by Manager onto *Container, used for storage
+// ---------------------------------------------------------------------------
+
+type ctxKey int
+
+const (
+	ctxKeyCodeExecutionEncryptionKey ctxKey = iota
+	ctxKeyBearer
+)
+
+func WithCodeExecutionEncryptionKey(ctx context.Context, key string) context.Context {
+	if key != "" {
+		ctx = context.WithValue(ctx, ctxKeyCodeExecutionEncryptionKey, key)
+	}
+	return ctx
+}
+
+func sessionCodeExecutionEncryptionKey(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyCodeExecutionEncryptionKey).(string)
+	return v
+}
+
+func WithBearer(ctx context.Context, bearer string) context.Context {
+	if bearer != "" {
+		ctx = context.WithValue(ctx, ctxKeyBearer, bearer)
+	}
+	return ctx
+}
+
+func sessionBearer(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyBearer).(string)
+	return v
 }
