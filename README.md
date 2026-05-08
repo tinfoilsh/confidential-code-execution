@@ -9,14 +9,101 @@
 - `create` — create a new file with given contents; fails if it already exists.
 - `insert` — insert text after a given line number in a file.
 
-## TODO: Code Visualization.
+## Flow
 
-1. the http server in main.go. Handles mcp
-2. The mcp redirect. Takes off the authorization & code execution keys. Any tool call goes to the orhcestrator
-3. the manager recieves both of these keys as context. It has it's own map (different box in visualization). It maps a tool call to the container
-4. the container recieves the tool call & returns data.
-5. The orchestartor has a pool of warm containers, and a pool of active ones, corresponding to the map
-6. When a container needs to be destroyed, the manager snapshots & uploads it
+### Tool call
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant M as mcp.go
+    participant Mgr as Manager
+    participant Cont as Container
+    box External
+    participant CP as Controlplane
+    participant B as Buckets
+    end
+
+    C->>M: POST /mcp (tools/call)<br/>headers: api_key, accessToken, [enc_key]
+    M->>CP: POST /api/shim/validate-key
+    CP-->>M: 200
+    M->>Mgr: dispatch(ctx, accessToken, args)
+
+    alt session hit
+        Mgr->>Mgr: reuse cached *Container from m.sessions
+    else session miss
+        Mgr->>Cont: GET /health (popped warm)
+        Cont-->>Mgr: 200
+        opt enc_key + bearer present
+            Mgr->>B: GET /items/{accessToken}
+            B-->>Mgr: plaintext tar
+            Mgr->>Cont: POST /restore (tar)
+        end
+        Mgr->>Mgr: m.sessions[accessToken] = container
+    end
+
+    Mgr->>Cont: POST /exec | /read | /write
+    Cont-->>Mgr: result
+    Mgr-->>M: text
+    M-->>C: JSON-RPC response
+```
+
+### Background loops
+
+```mermaid
+flowchart LR
+    subgraph Pool[Pool Manager]
+        direction TB
+        P1[tick: POLL_INTERVAL]
+        P1 --> P2{warm + inflight + sessions<br/>below target?}
+        P2 -->|yes| P3[create container]
+        P1 --> P4[poll inflight]
+        P4 -->|ready| P5[→ warm pool]
+    end
+
+    subgraph Health[Health Checker]
+        direction TB
+        H1[tick: HEALTH_CHECK_INTERVAL]
+        H1 --> H2[GET container /health]
+        H2 -->|200| H3[reset HealthFailures]
+        H2 -->|fail| H4[HealthFailures++]
+        H4 -->|≥ MAX_HEALTH_FAILURES| H5[evict + delete]
+    end
+
+    subgraph Evict[Idle Evictor]
+        direction TB
+        E1[tick: EvictionPoll]
+        E1 --> E2{LastActivity > IdleTimeout?}
+        E2 -->|yes| E3[POST container /snapshot]
+        E3 --> E4[PUT to buckets]
+        E4 --> E5[delete container]
+    end
+
+    P3 -.-> CP[(Controlplane)]
+    P4 -.-> CP
+    H5 -.-> CP
+    E5 -.-> CP
+    E4 -.-> B[(Buckets)]
+
+    classDef ext stroke-dasharray:5 5
+    class CP,B ext
+```
+
+### Container lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> deploying: createContainer
+    deploying --> ready: controlplane status=ready
+    deploying --> failed: deploy fail
+    ready --> failed: /health fail × MAX_HEALTH_FAILURES<br/>(periodic or pre-assign)
+    ready --> assigning: GetOrAssign + /health ok
+    assigning --> assigned: restore-on-assign done
+    assigned --> assigned: tools/call (refresh LastActivity)
+    assigned --> deleting: idle evict or shutdown<br/>(snapshot to buckets first)
+    deleting --> [*]
+    failed --> [*]
+```
 
 ## Manager
 
