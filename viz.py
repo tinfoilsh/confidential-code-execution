@@ -121,9 +121,6 @@ def _layout_boxes(
             if show_session and c.get("code_execution_access_token"):
                 active = c.get("active_time", 0)
                 sub = f"tok:{c['code_execution_access_token'][:12]}  active {fmt_uptime(active)}"
-                ssh_port = c.get("ssh_port", 0)
-                if ssh_port:
-                    extra = f"ssh -p {ssh_port} root@console.tinfoil.sh"
             rendered.append(box(label, sub, bg, box_width, extra))
 
         # zip the lines of each box together (may be 3 or 4 lines)

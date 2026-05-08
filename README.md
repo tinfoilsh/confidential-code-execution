@@ -32,8 +32,7 @@ go build .
 | `CONFIG_REPO`    | `tinfoilsh/code-execution-environment` | Image repo                         |
 
 |  
-| `DEBUG_MODE` | `true` | Pass `debug=true` to controlplane (enables SSH, modifies measurement) |
-| `VERIFY_ATTESTATION` | `false` | Verify enclave attestation + pin TLS public key. Requires `DEBUG_MODE=false`. |
+| `VERIFY_ATTESTATION` | `false` | Verify enclave attestation + pin TLS public key. |
 | `SKIP_JWT_VALIDATION` | `false` | Local dev only — accept `tools/call` without a Clerk JWT. Never set in prod. |
 | `HEALTH_CHECK_INTERVAL` | `15` | Seconds between `/health` probes of warm containers. |
 | `MAX_HEALTH_FAILURES` | `3` | Consecutive `/health` failures before a warm container is destroyed and replaced. |
@@ -72,15 +71,6 @@ python viz.py
 ```
 
 Polls `/metrics` every second. Shows warm pool (green), inflight (yellow), active sessions (cyan), and failures (red).
-
-### Agent
-
-`agent.py` defines our code-execution tools (bash & text editor) and runs a simple agent loop against Tinfoil inference to exercise the orchestrator end-to-end.
-
-```bash
-export TF_API_KEY="..."
-python agent.py
-```
 
 ## Environment Container
 

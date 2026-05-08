@@ -46,7 +46,6 @@ type Container struct {
 	Status     string
 	CreatedAt  time.Time
 	AssignedAt time.Time
-	SSHPort    int
 
 	httpClient *http.Client // proxy client (attested or plain)
 
@@ -90,12 +89,11 @@ type ManagerConfig struct {
 	PollInterval      time.Duration
 	ConfigRepo        string
 	ConfigTag         string
-	DebugMode         bool
 	VerifyAttestation bool
 	// SkipJWTValidation short-circuits AuthorizeSession to always pass.
-	// For local dev only — flip via SKIP_JWT_VALIDATION=true so agent.py
-	// and similar tools can hit /mcp without forwarding a Clerk JWT.
-	// Default false; never enable in prod.
+	// For local dev only — flip via SKIP_JWT_VALIDATION=true so test
+	// callers can hit /mcp without forwarding a Clerk JWT. Default
+	// false; never enable in prod.
 	SkipJWTValidation bool
 	// IdleTimeout is how long a session can have no tool activity before
 	// the orchestrator snapshots and evicts the container.
@@ -231,11 +229,9 @@ func (m *Manager) createContainer() *Container {
 	}
 	name := "daniel-exec-" + hex.EncodeToString(suffix)
 	body := map[string]any{
-		"name":     name,
-		"repo":     m.cfg.ConfigRepo,
-		"tag":      m.cfg.ConfigTag,
-		"debug":    m.cfg.DebugMode,
-		"ssh_keys": []string{"daniel"},
+		"name": name,
+		"repo": m.cfg.ConfigRepo,
+		"tag":  m.cfg.ConfigTag,
 	}
 	status, raw, err := m.apiRequest("POST", "/api/containers", body)
 	if err != nil || status != 201 {
@@ -246,9 +242,8 @@ func (m *Manager) createContainer() *Container {
 		return nil
 	}
 	var resp struct {
-		ID      string `json:"id"`
-		Domain  string `json:"domain"`
-		SSHPort int    `json:"ssh_port"`
+		ID     string `json:"id"`
+		Domain string `json:"domain"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return nil
@@ -259,7 +254,6 @@ func (m *Manager) createContainer() *Container {
 		Domain:    resp.Domain,
 		Status:    "deploying",
 		CreatedAt: time.Now(),
-		SSHPort:   resp.SSHPort,
 	}
 }
 
@@ -1010,11 +1004,10 @@ func (m *Manager) MetricsInfo() map[string]any {
 
 	rec := func(c *Container, accessToken string) map[string]any {
 		d := map[string]any{
-			"id":       c.ID,
-			"name":     c.Name,
-			"status":   c.Status,
-			"uptime":   int(now.Sub(c.CreatedAt).Seconds()),
-			"ssh_port": c.SSHPort,
+			"id":     c.ID,
+			"name":   c.Name,
+			"status": c.Status,
+			"uptime": int(now.Sub(c.CreatedAt).Seconds()),
 		}
 		if accessToken != "" {
 			d["code_execution_access_token"] = accessToken
