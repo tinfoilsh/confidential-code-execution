@@ -12,6 +12,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -22,6 +24,26 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// Snapshot cap covers /workspace tmpfs (512 MB) → ~683 MB after base64.
+const (
+	maxMCPRequestBody   = 1 << 20  // 1 MB
+	maxControlplaneBody = 1 << 20  // 1 MB
+	maxExecutorBody     = 16 << 20 // 16 MB
+	maxSnapshotBody     = 1 << 30  // 1 GB
+)
+
+// readLimited errors if r exceeds max, instead of silently truncating.
+func readLimited(r io.Reader, max int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return data, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("response exceeds %d bytes", max)
+	}
+	return data, nil
+}
 
 func envStr(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok {
@@ -93,6 +115,7 @@ func main() {
 
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxMCPRequestBody)
 		var req jsonRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})

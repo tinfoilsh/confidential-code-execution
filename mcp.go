@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"regexp"
 )
+
+// Format-validated so it can't path-traverse on buckets
+var validAccessTokenRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type jsonRPCRequest struct {
 	JSONRPC string         `json:"jsonrpc"`
@@ -55,6 +59,10 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		accessToken := headers.Get("X-Code-Execution-Access-Token")
 		if accessToken == "" {
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token header is required"}
+			return http.StatusBadRequest, resp
+		}
+		if !validAccessTokenRe.MatchString(accessToken) {
+			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token has invalid format"}
 			return http.StatusBadRequest, resp
 		}
 		bearer := extractBearer(headers.Get("Authorization"))

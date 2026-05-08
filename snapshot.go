@@ -14,7 +14,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 )
@@ -68,13 +67,16 @@ func (b *Buckets) fetch(ctx context.Context, bearer, accessToken, codeExecutionE
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
 		return nil, nil
 	}
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("buckets GET: %d", resp.StatusCode)
+	}
+	raw, err := readLimited(resp.Body, maxSnapshotBody)
+	if err != nil {
+		return nil, fmt.Errorf("buckets GET body: %w", err)
 	}
 
 	var body struct {
@@ -150,10 +152,10 @@ func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []b
 		return 0, fmt.Errorf("restore POST: %w", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	_, _ = readLimited(resp.Body, maxExecutorBody)
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
-		return resp.StatusCode, fmt.Errorf("restore returned %d: %s", resp.StatusCode, string(data))
+		return resp.StatusCode, fmt.Errorf("restore returned %d", resp.StatusCode)
 	}
 	return resp.StatusCode, nil
 }
@@ -176,10 +178,10 @@ func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) (
 		return nil, fmt.Errorf("snapshot POST: %w", err)
 	}
 	defer resp.Body.Close()
-	data, readErr := io.ReadAll(resp.Body)
+	data, readErr := readLimited(resp.Body, maxSnapshotBody)
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("snapshot returned %d: %s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("snapshot returned %d", resp.StatusCode)
 	}
 	if readErr != nil {
 		return nil, fmt.Errorf("read snapshot stream: %w", readErr)

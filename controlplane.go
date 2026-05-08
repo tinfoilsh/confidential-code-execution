@@ -54,12 +54,15 @@ func (cp *Controlplane) do(ctx context.Context, method, path string, body any) (
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, err := readLimited(resp.Body, maxControlplaneBody)
 	if resp.StatusCode >= 500 {
 		controlplaneErrors.Inc()
 	}
 	if resp.StatusCode >= 400 {
 		log.Printf("orchestrator: API error %d %s %s", resp.StatusCode, method, path)
+	}
+	if err != nil {
+		return resp.StatusCode, nil, err
 	}
 	return resp.StatusCode, data, nil
 }
@@ -71,7 +74,7 @@ func (cp *Controlplane) createContainer(repo, tag string) (*Container, error) {
 	if _, err := rand.Read(suffix); err != nil {
 		return nil, err
 	}
-	name := "daniel-exec-" + hex.EncodeToString(suffix)
+	name := "code-exec-" + hex.EncodeToString(suffix)
 	body := map[string]any{
 		"name": name,
 		"repo": repo,

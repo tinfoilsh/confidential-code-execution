@@ -10,7 +10,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"time"
@@ -53,10 +52,13 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 		return 502, []byte(fmt.Sprintf(`{"error":"container unavailable: %s"}`, err)), nil
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, readErr := readLimited(resp.Body, maxExecutorBody)
 	// Bump activity even on non-2xx — the user is still interacting.
 	c.LastActivity = time.Now()
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
+	if readErr != nil {
+		return resp.StatusCode, nil, readErr
+	}
 	return resp.StatusCode, data, nil
 }
 
