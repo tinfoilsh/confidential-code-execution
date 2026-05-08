@@ -33,6 +33,7 @@ go build .
 
 |  
 | `VERIFY_ATTESTATION` | `false` | Verify enclave attestation + pin TLS public key. |
+| `DEV_BYPASS_AUTH` | `false` | Local dev only — skip api_key validation. Never set in prod. |
 | `HEALTH_CHECK_INTERVAL` | `15` | Seconds between `/health` probes of warm containers. |
 | `MAX_HEALTH_FAILURES` | `3` | Consecutive `/health` failures before a warm container is destroyed and replaced. |
 

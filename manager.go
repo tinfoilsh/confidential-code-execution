@@ -90,6 +90,8 @@ type ManagerConfig struct {
 	ConfigRepo        string
 	ConfigTag         string
 	VerifyAttestation bool
+	// DevBypassAuth skips api_key validation. Local dev only.
+	DevBypassAuth bool
 	// IdleTimeout is how long a session can have no tool activity before
 	// the orchestrator snapshots and evicts the container.
 	IdleTimeout time.Duration

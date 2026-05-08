@@ -19,6 +19,9 @@ var ErrAuthRequired = errors.New("code execution requires a valid api key")
 //   - ErrAuthRequired       when bearer is empty or controlplane refuses
 //   - other err             on transport / unexpected upstream status
 func (m *Manager) AuthorizeSession(ctx context.Context, bearer string) error {
+	if m.cfg.DevBypassAuth {
+		return nil
+	}
 	if bearer == "" {
 		return ErrAuthRequired
 	}

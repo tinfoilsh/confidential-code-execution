@@ -65,6 +65,7 @@ func main() {
 		ConfigRepo:          envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
 		ConfigTag:           envStr("CONFIG_TAG", "v0.0.9"),
 		VerifyAttestation:   envBool("VERIFY_ATTESTATION", false),
+		DevBypassAuth:       envBool("DEV_BYPASS_AUTH", false),
 		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
 		HealthCheckInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 15)) * time.Second,
 		MaxHealthFailures:   envInt("MAX_HEALTH_FAILURES", 3),
