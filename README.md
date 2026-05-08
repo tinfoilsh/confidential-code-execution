@@ -14,38 +14,19 @@
 ### Tool call
 
 ```mermaid
-sequenceDiagram
-    participant C as Client
-    participant M as mcp.go
-    participant Mgr as Manager
-    participant Cont as Container
-    box External
-    participant CP as Controlplane
-    participant B as Buckets
-    end
+flowchart TD
+    C[Client] --> M[POST /mcp]
+    M --> A[validate api_key]
+    A -.-> CP[(Controlplane)]
+    A --> G{session known?}
+    G -->|yes| E[container: exec, read, write]
+    G -->|no| P[pop warm + restore]
+    P -.-> B[(Buckets)]
+    P --> E
+    E --> R[response]
 
-    C->>M: POST /mcp (tools/call)<br/>headers: api_key, accessToken, [enc_key]
-    M->>CP: POST /api/shim/validate-key
-    CP-->>M: 200
-    M->>Mgr: dispatch(ctx, accessToken, args)
-
-    alt session hit
-        Mgr->>Mgr: reuse cached *Container from m.sessions
-    else session miss
-        Mgr->>Cont: GET /health (popped warm)
-        Cont-->>Mgr: 200
-        opt enc_key + bearer present
-            Mgr->>B: GET /items/{accessToken}
-            B-->>Mgr: plaintext tar
-            Mgr->>Cont: POST /restore (tar)
-        end
-        Mgr->>Mgr: m.sessions[accessToken] = container
-    end
-
-    Mgr->>Cont: POST /exec | /read | /write
-    Cont-->>Mgr: result
-    Mgr-->>M: text
-    M-->>C: JSON-RPC response
+    classDef ext stroke-dasharray:5 5
+    class CP,B ext
 ```
 
 ### Background loops
