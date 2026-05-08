@@ -9,9 +9,17 @@
 - `create` — create a new file with given contents; fails if it already exists.
 - `insert` — insert text after a given line number in a file.
 
-## Flow
+## Flows
 
-### Tool call
+### Background loops
+
+The manager runs three background loops alongside the request path:
+
+- **Pool manager** — keeps the warm pool topped up. Each tick creates new containers via controlplane and promotes any inflight ones that hit `ready`.
+- **Health checker** — probes `/health` on every warm and assigned container. After `MAX_HEALTH_FAILURES` consecutive failures, evicts: plain delete for warm, snapshot-then-delete for sessions.
+- **Idle evictor** — scans sessions for `LastActivity > IdleTimeout`. Snapshots the container's `/workspace` to buckets, then deletes the container.
+
+### E2E
 
 ```mermaid
 flowchart TD
@@ -23,48 +31,6 @@ flowchart TD
     G -->|no| P[pop a warm container + restore]
     P <-.-> B[(Buckets)]
     P --> E
-
-    classDef ext stroke-dasharray:5 5
-    class CP,B ext
-```
-
-### Background loops
-
-```mermaid
-flowchart LR
-    subgraph Pool[Pool Manager]
-        direction TB
-        P1[tick: POLL_INTERVAL]
-        P1 --> P2{warm + inflight + sessions<br/>below target?}
-        P2 -->|yes| P3[create container]
-        P1 --> P4[poll inflight]
-        P4 -->|ready| P5[→ warm pool]
-    end
-
-    subgraph Health[Health Checker]
-        direction TB
-        H1[tick: HEALTH_CHECK_INTERVAL]
-        H1 --> H2[GET /health<br/>warm + session containers]
-        H2 -->|200| H3[reset HealthFailures]
-        H2 -->|fail| H4[HealthFailures++]
-        H4 -->|≥ MAX, warm| H5[delete]
-        H4 -->|≥ MAX, session| H6[snapshot + delete]
-    end
-
-    subgraph Evict[Idle Evictor]
-        direction TB
-        E1[tick: EvictionPoll]
-        E1 --> E2{LastActivity > IdleTimeout?}
-        E2 -->|yes| E3[POST container /snapshot]
-        E3 --> E4[PUT to buckets]
-        E4 --> E5[delete container]
-    end
-
-    P3 -.-> CP[(Controlplane)]
-    P4 -.-> CP
-    H5 -.-> CP
-    E5 -.-> CP
-    E4 -.-> B[(Buckets)]
 
     classDef ext stroke-dasharray:5 5
     class CP,B ext
