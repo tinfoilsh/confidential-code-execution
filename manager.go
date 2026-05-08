@@ -1,109 +1,75 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"sync"
 	"time"
-
-	"github.com/tinfoilsh/verifier/client"
 )
 
-// Operation timing
 var snapshotPutRetryDelay = 1 * time.Second
 var restorePushRetryDelay = 1 * time.Second
 var toolCallTimeout = 35 * time.Second
 
-// Per-sandbox environment configuration
 type Container struct {
 	ID         string
 	Name       string
 	Domain     string
-	Status     string //todo: can I enum this?
+	Status     string
 	CreatedAt  time.Time
 	AssignedAt time.Time
 	httpClient *http.Client
 
-	// CodeExecutionEncryptionKey is the user's symmetric AES-256 key
-	// (base64-encoded), cached from the request's
-	// X-Code-Execution-Encryption-Key header. The orchestrator uses it at
-	// eviction time to PUT the workspace tar to buckets under this key.
-	// The container itself never sees this value.
+	// User's symmetric AES-256 key (base64), cached from the request's
+	// X-Code-Execution-Encryption-Key. Used at eviction time to PUT the
+	// workspace tar to buckets. The container itself never sees this.
 	CodeExecutionEncryptionKey string
 
-	// Bearer is the api_key from the request's Authorization header, cached
-	// for use as the buckets bearer at restore-on-assign and eviction-time
-	// snapshot. Refreshed on every tools/call so a key rotation mid-session
-	// is picked up. Buckets resolves it to (user_id, org_id) for the
-	// storage prefix.
+	// api_key from the request's Authorization header, cached as the
+	// buckets bearer for restore-on-assign and eviction-time snapshot.
+	// Refreshed every tools/call so a key rotation mid-session is picked up.
 	Bearer string
 
-	// LastActivity is updated on every successful proxied tool call.
-	// The eviction loop uses it to decide when to snapshot+destroy.
 	LastActivity time.Time
 
-	// Consecutive403s counts back-to-back 403 responses from the
-	// executor's api-server token gate. Two in a row means the container
-	// has a different access token claimed than what we're sending —
-	// almost certainly a poisoned warm-pool container or session-map
-	// drift. recordContainerStatus tears it down at the threshold.
+	// Back-to-back 403s from the executor's access-token gate. Two in a
+	// row means a poisoned warm-pool container or session-map drift —
+	// recordContainerStatus tears down the session at the threshold.
 	// Reset on any 2xx. Guarded by Manager.mu.
 	Consecutive403s int
 
-	// HealthFailures counts back-to-back /health failures observed by
-	// the periodic health checker. Reaching MaxHealthFailures evicts the
-	// container from the warm pool and destroys it.
-	// Reset on any 200. Guarded by m.mu.
+	// Back-to-back /health failures from the periodic checker. At
+	// MaxHealthFailures we destroy the container.
+	// Reset on any 200. Guarded by Manager.mu.
 	HealthFailures int
 }
 
 type ManagerConfig struct {
-	AdminAPIKey string
-	// ControlPlaneURL is the controlplane root for /api/* calls.
-	// Overridable via CONTROL_PLANE_URL env var.
-	ControlPlaneURL string
-	// BucketsBase is the tinfoil-buckets root for snapshot storage.
-	// Overridable via BUCKETS_BASE env var.
-	BucketsBase     string
+	AdminAPIKey     string
+	ControlPlaneURL string // CONTROL_PLANE_URL
+	BucketsBase     string // BUCKETS_BASE
 	PoolSize        int
 	MaxContainers   int
 	PollInterval    time.Duration
 	EnvironmentRepo string
 	EnvironmentTag  string
-	// DevSkipAttestation skips enclave attestation. Local dev only.
+	// Local dev only — skip enclave attestation + TLS pinning.
 	DevSkipAttestation bool
-	// DevBypassAuth skips api_key validation. Local dev only.
+	// Local dev only — skip api_key validation.
 	DevBypassAuth bool
-	// IdleTimeout is how long a session can have no tool activity before
-	// the orchestrator snapshots and evicts the container.
-	IdleTimeout time.Duration
-	// EvictionPoll is how often the eviction loop wakes up to scan
-	// sessions. Roughly IdleTimeout / 10.
-	EvictionPoll time.Duration
-	// WarmPoolWaitTimeout caps how long GetOrAssign blocks waiting for a
-	// container when the warm pool is empty. Past the cap, the call
-	// returns "no containers available" so the client gets a fast error
-	// instead of an indefinite spinner.
+	// IdleTimeout is how long a session can be inactive before
+	// snapshot+evict. EvictionPoll is roughly IdleTimeout/10.
+	IdleTimeout         time.Duration
+	EvictionPoll        time.Duration
 	WarmPoolWaitTimeout time.Duration
-	// HealthCheckInterval is how often the background health checker
-	// scans every warm container's /health. Independent of the pool manager loop
 	HealthCheckInterval time.Duration
-	// MaxHealthFailures is the consecutive-failure threshold at which
-	// the health checker yanks a warm container from the pool and
-	// destroys it.
-	MaxHealthFailures int
-	// ShutdownDeadline caps the time Finish spends snapshotting active
-	// sessions before bulk-deleting whatever's left. Tune per platform:
-	// k8s/ECS default 30s grace fits 25s; Cloud Run/Docker default 10s
-	// needs a smaller value (or a longer grace period).
+	MaxHealthFailures   int
+	// Caps Finish's session snapshot phase before bulk-delete. Tune per
+	// platform: k8s/ECS default 30s grace fits 25s; Cloud Run/Docker
+	// default 10s needs less (or a longer grace period).
 	ShutdownDeadline time.Duration
 }
 
@@ -115,7 +81,7 @@ type Manager struct {
 	warmPool     []*Container
 	inflight     []*Container
 	sessions     map[string]*Container
-	assignLocks  map[string]*sync.Mutex // per-execSessionID serialization, see lockSession
+	assignLocks  map[string]*sync.Mutex // see lockSession
 	failed       []*Container
 	failCount    int
 	apiErrors    int
@@ -153,24 +119,19 @@ func NewManager(cfg ManagerConfig) *Manager {
 		cfg:         cfg,
 		sessions:    map[string]*Container{},
 		assignLocks: map[string]*sync.Mutex{},
-		// 120s budget covers snapshot PUT/GET against controlplane at the
-		// /workspace tmpfs ceiling: 512 MB plaintext → ~683 MB after base64
-		// encoding into the JSON body. Container CRUD calls also share this
-		// client but finish in well under a second, so the longer cap
-		// doesn't affect them.
+		// 120s covers snapshot PUT/GET at the /workspace tmpfs ceiling:
+		// 512 MB plaintext → ~683 MB after base64. Container CRUD shares
+		// this client but finishes in well under a second.
 		apiClient: &http.Client{Timeout: 120 * time.Second},
 	}
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
 
-// lockSession returns a mutex specific to execSessionID. Callers should
-// hold it across the read-or-restore-then-assign critical section so that
-// two concurrent webapp tabs hitting GetOrAssign with the same session
-// don't both pull a fresh container from the warm pool. The first one
-// wins; the second sees the in-memory hit and re-uses the assigned
-// container. Locks are kept indefinitely (one per session, cheap) until
-// CleanupSession drops them.
+// lockSession serializes the read-or-restore-then-assign critical
+// section across concurrent GetOrAssign calls for the same session, so
+// two tabs from the same chat don't both pull a fresh container and
+// double-restore. Locks are kept until CleanupSession.
 func (m *Manager) lockSession(accessToken string) *sync.Mutex {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -180,138 +141,6 @@ func (m *Manager) lockSession(accessToken string) *sync.Mutex {
 	l := &sync.Mutex{}
 	m.assignLocks[accessToken] = l
 	return l
-}
-
-// ---------------------------------------------------------------------------
-// Controlplane API
-// ---------------------------------------------------------------------------
-
-func (m *Manager) apiRequest(method, path string, body any) (int, []byte, error) {
-	return m.apiRequestWithHeaders(method, path, body, nil)
-}
-
-// apiRequestWithHeaders is apiRequest plus caller-controlled headers.
-func (m *Manager) apiRequestWithHeaders(method, path string, body any, extra map[string]string) (int, []byte, error) {
-	var buf io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return 0, nil, err
-		}
-		buf = bytes.NewReader(b)
-	}
-	req, err := http.NewRequest(method, m.cfg.ControlPlaneURL+path, buf)
-	if err != nil {
-		return 0, nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+m.cfg.AdminAPIKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
-	for k, v := range extra {
-		req.Header.Set(k, v)
-	}
-
-	resp, err := m.apiClient.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		log.Printf("orchestrator: API error %d %s %s: %s", resp.StatusCode, method, path, data)
-	}
-	return resp.StatusCode, data, nil
-}
-
-func (m *Manager) createContainer() *Container {
-	suffix := make([]byte, 4)
-	if _, err := rand.Read(suffix); err != nil {
-		return nil
-	}
-	name := "daniel-exec-" + hex.EncodeToString(suffix)
-	body := map[string]any{
-		"name": name,
-		"repo": m.cfg.EnvironmentRepo,
-		"tag":  m.cfg.EnvironmentTag,
-	}
-	status, raw, err := m.apiRequest("POST", "/api/containers", body)
-	if err != nil || status != 201 {
-		log.Printf("orchestrator: failed to create container %s: %d %v", name, status, err)
-		m.mu.Lock()
-		m.apiErrors++
-		m.mu.Unlock()
-		return nil
-	}
-	var resp struct {
-		ID     string `json:"id"`
-		Domain string `json:"domain"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil
-	}
-	return &Container{
-		ID:        resp.ID,
-		Name:      name,
-		Domain:    resp.Domain,
-		Status:    "deploying",
-		CreatedAt: time.Now(),
-	}
-}
-
-func (m *Manager) pollContainer(id string) string {
-	status, raw, err := m.apiRequest("GET", "/api/containers/"+id, nil)
-	if err != nil || status != 200 {
-		return ""
-	}
-	var resp struct {
-		Status string `json:"status"`
-	}
-	json.Unmarshal(raw, &resp)
-	return resp.Status
-}
-
-func (m *Manager) deleteContainer(id string) {
-	m.apiRequest("DELETE", "/api/containers/"+id, nil)
-}
-
-func (m *Manager) verifyContainerName(c *Container) bool {
-	status, raw, err := m.apiRequest("GET", "/api/containers/"+c.ID, nil)
-	if err != nil || status != 200 {
-		log.Printf("orchestrator: skip delete %s (%s) — not found on controlplane (%d)", c.Name, c.ID, status)
-		return false
-	}
-	var resp struct {
-		Name string `json:"name"`
-	}
-	json.Unmarshal(raw, &resp)
-	if resp.Name != c.Name {
-		log.Printf("orchestrator: skip delete %s (%s) — name mismatch: remote=%s", c.Name, c.ID, resp.Name)
-		return false
-	}
-	return true
-}
-
-// ---------------------------------------------------------------------------
-// Attestation / proxy client
-// ---------------------------------------------------------------------------
-
-func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
-	// 90s ceiling on the container client covers snapshot/restore bulk
-	// transfers at the /workspace tmpfs ceiling. /exec, /read, /write
-	// hold to the tighter toolCallTimeout (35s) via per-request context,
-	// so a runaway tool call can't tie up a session for the full 90s.
-	if m.cfg.DevSkipAttestation {
-		log.Printf("orchestrator: skipping attestation for %s (%s)", c.Name, c.Domain)
-		return &http.Client{Timeout: 90 * time.Second}, nil
-	}
-	sc := client.NewSecureClient(c.Domain, m.cfg.EnvironmentRepo)
-	httpClient, err := sc.HTTPClient()
-	if err != nil {
-		return nil, err
-	}
-	httpClient.Timeout = 90 * time.Second
-	log.Printf("orchestrator: attestation verified for %s (%s)", c.Name, c.Domain)
-	return httpClient, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -463,31 +292,12 @@ func (m *Manager) poolManagerLoop() {
 // Session management
 // ---------------------------------------------------------------------------
 
-// GetOrAssign returns an existing session's container or assigns one from
-// the warm pool, blocking up to 60s. isConnected is consulted while waiting
-// so a disconnected client can short-circuit.
-//
-// Per-execSessionId serialization: two concurrent tabs hitting this with
-// the same session ID race on a per-session mutex (lockSession). Only one
-// of them pulls a fresh container and runs restore; the other waits, then
-// sees the in-memory hit and shares the same container. This prevents
-// double-assignment and double-restore.
-//
-// Pre-assign /health: warm containers can die between the periodic
-// health pass and now (process crash, exec.sock disappearing, etc.).
-// We probe /health right after popping; a non-200 means we discard
-// the candidate and pop again.
-//
-// The user's Code Execution Encryption Key (read from ctx via
-// sessionCodeExecutionEncryptionKey) is cached on
-// c.CodeExecutionEncryptionKey so the eviction loop can PUT the snapshot
-// to buckets under it long after the request returns. We refresh on
-// every call so a key rotation mid-session is picked up. When a key is
-// present at assign time we also try to restore from buckets — buckets
-// returns 404 if no snapshot exists yet, in which case we proceed with
-// an empty workspace.
+// GetOrAssign returns the session's existing container or pops one from
+// the warm pool, runs restore-on-assign, and registers it. Concurrent
+// calls for the same session serialize on a per-session mutex so they
+// share one container. Pre-assign /health filters warm containers that
+// died between the periodic check and now.
 func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnected func() bool) (*Container, string) {
-	// Take the per-session lock first. This is the serialization point.
 	sl := m.lockSession(accessToken)
 	sl.Lock()
 	defer sl.Unlock()
@@ -526,7 +336,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 				log.Printf("orchestrator: client disconnected while waiting for session %s", accessToken)
 				return nil, "client disconnected"
 			}
-			// wait up to 2s at a time so we can re-check connection / deadline
+			// wake every 2s to re-check connection / deadline
 			go func() {
 				time.Sleep(2 * time.Second)
 				m.cond.Broadcast()
@@ -558,9 +368,8 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	}
 	m.mu.Unlock()
 
-	// Restore-on-assign. Failures here log and continue with an empty
-	// workspace — better than refusing to assign and breaking the user's
-	// chat entirely.
+	// Restore failures fall through to a fresh empty workspace — better
+	// than refusing to assign and breaking the user's chat.
 	if codeExecutionEncryptionKey != "" && bearer != "" {
 		if err := m.restoreInto(ctx, bearer, accessToken, c, codeExecutionEncryptionKey); err != nil {
 			log.Printf("orchestrator: restore failed for session %s on %s: %v (continuing with empty workspace)",
@@ -581,25 +390,19 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	return c, ""
 }
 
-// restoreInto fetches the snapshot for accessToken from buckets (which
-// decrypts under the supplied Code Execution Encryption Key) and pushes
-// the plaintext tar into the container's /restore. No-op when the
-// bucket has no entry, or when the supplied key can't open the entry —
-// both surface as a fresh empty workspace.
+// restoreInto fetches the snapshot for accessToken from buckets and
+// pushes the plaintext tar into the container's /restore. Empty bucket
+// or unreadable-with-this-key both surface as a fresh workspace.
 func (m *Manager) restoreInto(ctx context.Context, bearer, accessToken string, c *Container, codeExecutionEncryptionKeyB64 string) error {
 	tarBytes, err := m.fetchSnapshotTar(ctx, bearer, accessToken, codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return fmt.Errorf("fetch snapshot: %w", err)
 	}
 	if tarBytes == nil {
-		// No snapshot (or unreadable with this key) — fresh container, fine.
 		return nil
 	}
-	// Bounded retry on transient failure (network blip, executor 5xx,
-	// 502 from api-server). 4xx (incl. 403 token mismatch, 410 window
-	// closed) won't recover — bail immediately and let the consecutive-
-	// 403s counter handle the poisoned-container case via the user's
-	// next call.
+	// One retry on transient (5xx, network). 4xx (incl. 403 token
+	// mismatch, 410 window closed) won't recover — bail.
 	status, err := m.pushRestore(c, accessToken, tarBytes)
 	if err != nil && (status == 0 || status >= 500) {
 		log.Printf("orchestrator: pushRestore transient failure for session %s: %v — retrying once", accessToken, err)
@@ -629,13 +432,9 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 	return c
 }
 
-// evictAndSnapshot snapshots the container's workspace (if a Code
-// Execution Encryption Key and bearer were cached) and PUTs the
-// plaintext tar to buckets, which encrypts it under the cached key.
-// Then deletes the container. Called by the idle-eviction loop.
-// Snapshot failures still destroy the container — losing state is
-// bad, but leaving stale containers around is worse and the user can
-// always start fresh.
+// evictAndSnapshot snapshots the workspace to buckets (if keys are
+// cached) then deletes the container. Snapshot failures still destroy:
+// losing state is bad, leaving stale containers is worse.
 func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 	switch {
 	case c.CodeExecutionEncryptionKey == "":
@@ -649,8 +448,7 @@ func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 			log.Printf("orchestrator: snapshot failed for session %s on %s: %v", accessToken, c.Name, err)
 		} else {
 			// One retry on transient PUT failure: a single buckets blip
-			// shouldn't cost a user their workspace. Beyond that we accept
-			// the loss and the user starts fresh on next chat open.
+			// shouldn't cost a user their workspace.
 			putErr := m.putSnapshotTar(ctx, c.Bearer, accessToken, c.CodeExecutionEncryptionKey, tarBytes)
 			if putErr != nil {
 				log.Printf("orchestrator: PUT snapshot failed for session %s: %v — retrying once", accessToken, putErr)
@@ -668,10 +466,6 @@ func (m *Manager) evictAndSnapshot(accessToken string, c *Container) {
 	m.deleteContainer(c.ID)
 }
 
-// StartEvictionLoop launches the background goroutine that scans
-// sessions for idleness and snapshot+evicts any whose LastActivity is
-// older than IdleTimeout. Idempotent intent: there's currently no
-// guard against starting it twice, but main.go calls it exactly once.
 func (m *Manager) StartEvictionLoop() {
 	go m.evictionLoop()
 }
@@ -686,10 +480,6 @@ func (m *Manager) evictionLoop() {
 	}
 }
 
-// evictIdleSessions snapshots each session whose LastActivity is older
-// than IdleTimeout, then destroys the container. Walks the session
-// map under the global lock to pick targets, releases the lock to do
-// the (slow) snapshot+PUT+delete dance per target.
 func (m *Manager) evictIdleSessions() {
 	type target struct {
 		accessToken string
@@ -704,11 +494,9 @@ func (m *Manager) evictIdleSessions() {
 			targets = append(targets, target{sid, c})
 		}
 	}
+	// Drop session entries up front but keep the assign lock so a
+	// concurrent GetOrAssign queues behind us cleanly.
 	for _, t := range targets {
-		// Drop the session entry but keep the assign lock to serialize
-		// against any in-flight GetOrAssign for the same session: a
-		// request arriving mid-eviction either sees the deletion and
-		// assigns a fresh container, or queues behind the evictor cleanly.
 		delete(m.sessions, t.accessToken)
 	}
 	m.mu.Unlock()
@@ -746,12 +534,6 @@ func (m *Manager) checkContainerHealth(c *Container) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// StartHealthCheckLoop launches the background goroutine that probes
-// every warm and assigned container's /health on a fixed cadence.
-// Warm containers that fail MaxHealthFailures consecutive checks are
-// destroyed (pool manager replenishes); session containers go through
-// the snapshot-then-delete path so workspace state has a chance to
-// survive.
 func (m *Manager) StartHealthCheckLoop() {
 	go m.healthCheckLoop()
 }
@@ -768,8 +550,7 @@ func (m *Manager) healthCheckLoop() {
 }
 
 // shouldEvictForHealth probes /health, updates HealthFailures, and
-// returns true iff the threshold was hit and the caller should evict.
-// label is just a log tag ("warm" / "session").
+// returns true iff the threshold was hit. label is just a log tag.
 func (m *Manager) shouldEvictForHealth(c *Container, label string) bool {
 	if m.checkContainerHealth(c) {
 		m.mu.Lock()
@@ -788,11 +569,6 @@ func (m *Manager) shouldEvictForHealth(c *Container, label string) bool {
 	return true
 }
 
-// scanWarmHealth probes warm containers and plain-deletes any that hit
-// the failure threshold. A container that's been pulled by GetOrAssign
-// since we snapshotted the pool is no longer in m.warmPool when we go
-// to evict — the removal becomes a no-op and the in-flight request
-// surfaces the failure on its own.
 func (m *Manager) scanWarmHealth() {
 	m.mu.Lock()
 	targets := append([]*Container(nil), m.warmPool...)
@@ -828,11 +604,10 @@ func (m *Manager) scanWarmHealth() {
 	}
 }
 
-// scanSessionHealth probes session containers and routes failed ones
-// through evictAndSnapshot so workspace state can survive when the
-// container is dead (snapshot fetch will fail; evictAndSnapshot logs
-// and falls back to plain delete). Async so a slow snapshot doesn't
-// block the next health tick.
+// scanSessionHealth routes failed session containers through
+// evictAndSnapshot — workspace state may survive when the api-server is
+// the part that's wedged. Async so a slow snapshot doesn't block the
+// next health tick.
 func (m *Manager) scanSessionHealth() {
 	type target struct {
 		accessToken string
@@ -871,6 +646,10 @@ func (m *Manager) scanSessionHealth() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
+
 func (m *Manager) CleanupAll() map[string]any {
 	m.mu.Lock()
 	all := append([]*Container{}, m.warmPool...)
@@ -899,14 +678,10 @@ func (m *Manager) CleanupAll() map[string]any {
 	return map[string]any{"deleted": deleted, "skipped": skipped, "count": len(deleted)}
 }
 
-// Finish snapshots every active session in parallel (mirroring the idle
-// eviction path) then bulk-deletes any remaining containers. Bounded by
-// cfg.ShutdownDeadline so we exit cleanly under the platform's grace
-// period.
-//
-// Sessions whose snapshot doesn't finish in time fall through to
-// CleanupAll's plain delete — their state is lost. Warm and inflight
-// containers go straight to plain delete (no user state to preserve).
+// Finish snapshots every active session in parallel (mirroring idle
+// eviction) then bulk-deletes any remaining containers. Sessions whose
+// snapshot doesn't finish within ShutdownDeadline fall through to
+// CleanupAll's plain delete — their state is lost.
 func (m *Manager) Finish() map[string]any {
 	m.shuttingDown = true
 	log.Printf("orchestrator: finishing — snapshotting sessions and deleting all containers")
@@ -948,126 +723,6 @@ func (m *Manager) Finish() map[string]any {
 	result := m.CleanupAll()
 	result["status"] = "finished"
 	return result
-}
-
-// ---------------------------------------------------------------------------
-// Container proxy + high-level operations
-// ---------------------------------------------------------------------------
-
-func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path string, body []byte) (int, []byte, error) {
-	if c.httpClient == nil {
-		return 0, nil, fmt.Errorf("no http client for container %s", c.Name)
-	}
-	url := "https://" + c.Domain + path
-	callCtx, cancel := context.WithTimeout(ctx, toolCallTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(callCtx, "POST", url, bytes.NewReader(body))
-	if err != nil {
-		return 0, nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return 502, []byte(fmt.Sprintf(`{"error":"container unavailable: %s"}`, err)), nil
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	// Record activity on every reachable proxy hop. The eviction loop
-	// uses this to compute idleness, so we want it bumped even on
-	// non-2xx responses (the user is still interacting with us).
-	c.LastActivity = time.Now()
-	m.recordContainerStatus(accessToken, c, resp.StatusCode)
-	return resp.StatusCode, data, nil
-}
-
-// recordContainerStatus updates the consecutive-403s counter on c after a
-// container-bound call. 2xx resets to 0; 403 increments and triggers
-// CleanupSession at threshold. Other status codes (incl. 401, which
-// would be an orchestrator bug not a poisoned container) are ignored.
-//
-// Invoked by every path that talks to the executor: proxy (exec/read/
-// write), pushRestore, fetchSnapshotFromContainer.
-func (m *Manager) recordContainerStatus(accessToken string, c *Container, status int) {
-	if status >= 200 && status < 300 {
-		m.mu.Lock()
-		c.Consecutive403s = 0
-		m.mu.Unlock()
-		return
-	}
-	if status != http.StatusForbidden {
-		return
-	}
-	m.mu.Lock()
-	c.Consecutive403s++
-	n := c.Consecutive403s
-	m.mu.Unlock()
-	if n >= 2 {
-		log.Printf("orchestrator: container %s rejected access token for session %s twice — destroying", c.Name, accessToken)
-		m.CleanupSession(accessToken)
-	}
-}
-
-// ExecCommand runs a bash command in the session's container.
-func (m *Manager) ExecCommand(ctx context.Context, accessToken, command string) map[string]any {
-	c, errMsg := m.GetOrAssign(ctx, accessToken, nil)
-	if c == nil {
-		return map[string]any{"error": errMsg}
-	}
-	body, _ := json.Marshal(map[string]string{"command": command})
-	status, raw, _ := m.proxy(ctx, c, accessToken, "/exec", body)
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status), "raw": string(raw)}
-	}
-	return out
-}
-
-// ReadFile reads a text file from the session's container.
-func (m *Manager) ReadFile(ctx context.Context, accessToken, path string) (string, error) {
-	c, errMsg := m.GetOrAssign(ctx, accessToken, nil)
-	if c == nil {
-		return "", fmt.Errorf("%s", errMsg)
-	}
-	body, _ := json.Marshal(map[string]string{"path": path})
-	_, raw, _ := m.proxy(ctx, c, accessToken, "/read", body)
-	var resp struct {
-		Contents string `json:"contents"`
-		Error    string `json:"error"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", err
-	}
-	if resp.Error != "" {
-		return "", fmt.Errorf("%s", resp.Error)
-	}
-	decoded, err := base64.StdEncoding.DecodeString(resp.Contents)
-	if err != nil {
-		return "", err
-	}
-	return string(decoded), nil
-}
-
-// WriteFile writes text content to a file on the session's container.
-func (m *Manager) WriteFile(ctx context.Context, accessToken, path, content string) map[string]any {
-	c, errMsg := m.GetOrAssign(ctx, accessToken, nil)
-	if c == nil {
-		return map[string]any{"error": errMsg}
-	}
-	encoded := base64.StdEncoding.EncodeToString([]byte(content))
-	body, _ := json.Marshal(map[string]string{"path": path, "contents": encoded})
-	status, raw, _ := m.proxy(ctx, c, accessToken, "/write", body)
-	var out map[string]any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status)}
-	}
-	return out
-}
-
-// FileExists returns true iff the file is readable.
-func (m *Manager) FileExists(ctx context.Context, accessToken, path string) bool {
-	_, err := m.ReadFile(ctx, accessToken, path)
-	return err == nil
 }
 
 // ---------------------------------------------------------------------------
