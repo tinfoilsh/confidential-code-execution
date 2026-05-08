@@ -87,8 +87,8 @@ type ManagerConfig struct {
 	PoolSize          int
 	MaxContainers     int
 	PollInterval      time.Duration
-	ConfigRepo        string
-	ConfigTag         string
+	EnvironmentRepo   string
+	EnvironmentTag    string
 	VerifyAttestation bool
 	// DevBypassAuth skips api_key validation. Local dev only.
 	DevBypassAuth bool
@@ -227,8 +227,8 @@ func (m *Manager) createContainer() *Container {
 	name := "daniel-exec-" + hex.EncodeToString(suffix)
 	body := map[string]any{
 		"name": name,
-		"repo": m.cfg.ConfigRepo,
-		"tag":  m.cfg.ConfigTag,
+		"repo": m.cfg.EnvironmentRepo,
+		"tag":  m.cfg.EnvironmentTag,
 	}
 	status, raw, err := m.apiRequest("POST", "/api/containers", body)
 	if err != nil || status != 201 {
@@ -305,7 +305,7 @@ func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
 		log.Printf("orchestrator: skipping attestation for %s (%s)", c.Name, c.Domain)
 		return &http.Client{Timeout: 90 * time.Second}, nil
 	}
-	sc := client.NewSecureClient(c.Domain, m.cfg.ConfigRepo)
+	sc := client.NewSecureClient(c.Domain, m.cfg.EnvironmentRepo)
 	httpClient, err := sc.HTTPClient()
 	if err != nil {
 		return nil, err

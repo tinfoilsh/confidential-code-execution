@@ -29,7 +29,8 @@ go build .
 | `MAX_CONTAINERS` | `10`                                   | Hard cap on concurrent containers  |
 | `PORT`           | `7070`                                 | Orchestrator listen port           |
 | `POLL_INTERVAL`  | `2`                                    | Seconds between controlplane polls |
-| `CONFIG_REPO`    | `tinfoilsh/code-execution-environment` | Image repo                         |
+| `ENVIRONMENT_REPO` | `tinfoilsh/code-execution-environment` | Source repo for the executor image |
+| `ENVIRONMENT_TAG`  | `v0.0.9`                               | Image tag to deploy                |
 
 |  
 | `VERIFY_ATTESTATION` | `false` | Verify enclave attestation + pin TLS public key. |

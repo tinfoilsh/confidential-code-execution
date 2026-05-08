@@ -62,8 +62,8 @@ func main() {
 		PoolSize:            envInt("POOL_SIZE", 3),
 		MaxContainers:       envInt("MAX_CONTAINERS", 10),
 		PollInterval:        time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
-		ConfigRepo:          envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
-		ConfigTag:           envStr("CONFIG_TAG", "v0.0.9"),
+		EnvironmentRepo:     envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
+		EnvironmentTag:      envStr("ENVIRONMENT_TAG", "v0.0.9"),
 		VerifyAttestation:   envBool("VERIFY_ATTESTATION", false),
 		DevBypassAuth:       envBool("DEV_BYPASS_AUTH", false),
 		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
@@ -78,7 +78,7 @@ func main() {
 
 	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v verify_attestation=%v",
 		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.VerifyAttestation)
-	log.Printf("orchestrator: repo=%s tag=%s", cfg.ConfigRepo, cfg.ConfigTag)
+	log.Printf("orchestrator: repo=%s tag=%s", cfg.EnvironmentRepo, cfg.EnvironmentTag)
 	mgr := NewManager(cfg)
 	mgr.StartPoolManager()
 	mgr.StartEvictionLoop()
