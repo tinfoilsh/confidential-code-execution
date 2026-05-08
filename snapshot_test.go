@@ -302,7 +302,7 @@ func TestEvictAndSnapshot(t *testing.T) {
 	bk := newFakeBuckets()
 	defer bk.Close()
 	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL})
-	m.evictAndSnapshot("sess-evict", c)
+	m.evictAndSnapshot(context.Background(), "sess-evict", c)
 
 	bk.mu.Lock()
 	stored, ok := bk.stored["sess-evict"]
@@ -334,7 +334,7 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	defer func() { snapshotPutRetryDelay = prevDelay }()
 
 	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL})
-	m.evictAndSnapshot("sess-retry", c)
+	m.evictAndSnapshot(context.Background(), "sess-retry", c)
 
 	bk.mu.Lock()
 	attempts := bk.putAttempts
@@ -396,7 +396,7 @@ func TestFetchSnapshotRejectsTruncatedStream(t *testing.T) {
 	c := fakeContainer(fc)
 
 	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
-	_, err := m.fetchSnapshotFromContainer(c, "sess-truncated")
+	_, err := m.fetchSnapshotFromContainer(context.Background(), c, "sess-truncated")
 	if err == nil {
 		t.Fatalf("expected error on missing snapshot trailer, got nil")
 	}

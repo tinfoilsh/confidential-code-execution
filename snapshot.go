@@ -163,11 +163,11 @@ func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []b
 // Streams a plaintext tar of /workspace.
 // Clean stream is signaled by the X-Snapshot-Status: ok HTTP trailer;
 // 200 with the trailer absent or != "ok" means there was a problem.
-func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) ([]byte, error) {
+func (m *Manager) fetchSnapshotFromContainer(ctx context.Context, c *Container, accessToken string) ([]byte, error) {
 	if c.httpClient == nil {
 		return nil, fmt.Errorf("no http client for container %s", c.Name)
 	}
-	req, err := http.NewRequest("POST", "https://"+c.Domain+"/snapshot", bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+c.Domain+"/snapshot", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, err
 	}

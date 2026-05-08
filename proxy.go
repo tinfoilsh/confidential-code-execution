@@ -48,7 +48,8 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 502, []byte(fmt.Sprintf(`{"error":"container unavailable: %s"}`, err)), nil
+		body, _ := json.Marshal(map[string]string{"error": "container unavailable: " + err.Error()})
+		return 502, body, nil
 	}
 	defer resp.Body.Close()
 	data, readErr := readLimited(resp.Body, maxExecutorBody)
