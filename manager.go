@@ -107,9 +107,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 }
 
 // lockSession serializes the read-or-restore-then-assign critical
-// section across concurrent GetOrAssign calls for the same session, so
-// two tabs from the same chat don't both pull a fresh container and
-// double-restore. Locks are kept until CleanupSession.
+// section across concurrent GetOrAssign calls for the same lockSession
 func (m *Manager) lockSession(accessToken string) *sync.Mutex {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -128,15 +126,12 @@ func (m *Manager) lockSession(accessToken string) *sync.Mutex {
 func (m *Manager) replenishPool() []*Container {
 	m.mu.Lock()
 	total := len(m.warmPool) + len(m.inflight) + len(m.sessions)
-	target := len(m.sessions) + m.cfg.PoolSize
-	if target > m.cfg.MaxContainers {
-		target = m.cfg.MaxContainers
-	}
+	target := min(len(m.sessions)+m.cfg.PoolSize, m.cfg.MaxContainers)
 	needed := target - total
 	m.mu.Unlock()
 
 	var created []*Container
-	for i := 0; i < needed; i++ {
+	for range needed {
 		c, err := m.cp.createContainer(m.cfg.EnvironmentRepo, m.cfg.EnvironmentTag)
 		if err != nil {
 			break
@@ -242,20 +237,8 @@ func (m *Manager) poolManagerLoop() {
 			consecutiveFailures = 0
 		}
 
-		mult := 1
-		if consecutiveFailures > 0 {
-			n := consecutiveFailures
-			if n > 4 {
-				n = 4
-			}
-			for i := 0; i < n; i++ {
-				mult *= 2
-			}
-		}
-		delay := m.cfg.PollInterval * time.Duration(mult)
-		if delay > 30*time.Second {
-			delay = 30 * time.Second
-		}
+		// Exponential backoff capped at 16× and 30s.
+		delay := min(m.cfg.PollInterval<<min(consecutiveFailures, 4), 30*time.Second)
 		select {
 		case <-m.done:
 			return
@@ -553,25 +536,6 @@ func (m *Manager) evictSessionAsync(accessToken string, c *Container) {
 // Health checking
 // ---------------------------------------------------------------------------
 
-func (m *Manager) checkContainerHealth(c *Container) bool {
-	if c.httpClient == nil {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+c.Domain+"/health", nil)
-	if err != nil {
-		return false
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	return resp.StatusCode == http.StatusOK
-}
-
 func (m *Manager) StartHealthCheckLoop() {
 	go m.healthCheckLoop()
 }
@@ -593,6 +557,25 @@ func (m *Manager) healthCheckLoop() {
 			}()
 		}
 	}
+}
+
+func (m *Manager) checkContainerHealth(c *Container) bool {
+	if c.httpClient == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://"+c.Domain+"/health", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode == http.StatusOK
 }
 
 // label ("warm" / "session")
@@ -640,10 +623,7 @@ func (m *Manager) scanWarmHealth() {
 	}
 }
 
-// scanSessionHealth routes failed session containers through
-// evictAndSnapshot — workspace state may survive when the api-server is
-// the part that's wedged. Async so a slow snapshot doesn't block the
-// next health tick.
+// Async so a slow snapshot doesn't block the next health tick.
 func (m *Manager) scanSessionHealth() {
 	type target struct {
 		accessToken string
@@ -689,10 +669,8 @@ func (m *Manager) CleanupAll() {
 	}
 }
 
-// Finish snapshots every active session in parallel (mirroring idle
-// eviction) then bulk-deletes any remaining containers. Sessions whose
-// snapshot doesn't finish within ShutdownDeadline fall through to
-// CleanupAll's plain delete — their state is lost.
+// Finish snapshots every active session in parallel then bulk-deletes any remaining containers.
+// Sessions whose snapshot doesn't finish within ShutdownDeadline lose state.
 func (m *Manager) Finish() {
 	m.finishOnce.Do(func() {
 		close(m.done)
