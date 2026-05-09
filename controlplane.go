@@ -162,8 +162,11 @@ func (cp *Controlplane) validateKey(ctx context.Context, apiKey string) (int, er
 
 var ErrAuthRequired = errors.New("code execution requires a valid api key")
 
-// Bounds how long a positive validate-key response is reused.
-const authCacheTTL = 30 * time.Second
+const (
+	// Bounds how long a positive validate-key response is reused.
+	authCacheTTL        = 30 * time.Second
+	authCacheMaxEntries = 1024
+)
 
 func (m *Manager) authCacheCheck(bearer string) bool {
 	m.authCacheMu.Lock()
@@ -179,44 +182,25 @@ func (m *Manager) authCacheCheck(bearer string) bool {
 	return true
 }
 
+// If the cache is at capacity, sweep expired entries first
 func (m *Manager) authCacheStore(bearer string) {
 	m.authCacheMu.Lock()
 	defer m.authCacheMu.Unlock()
+	if len(m.authCache) >= authCacheMaxEntries {
+		now := time.Now()
+		for k, exp := range m.authCache {
+			if now.After(exp) {
+				delete(m.authCache, k)
+			}
+		}
+		for k := range m.authCache {
+			if len(m.authCache) < authCacheMaxEntries {
+				break
+			}
+			delete(m.authCache, k)
+		}
+	}
 	m.authCache[bearer] = time.Now().Add(authCacheTTL)
-}
-
-// AuthorizeSession verifies the bearer is a valid api_key.
-//
-//   - nil               on a valid api_key (200)
-//   - ErrAuthRequired   when bearer is empty or controlplane refuses
-//   - other err         on transport / unexpected upstream status
-func (m *Manager) AuthorizeSession(ctx context.Context, bearer string) error {
-	if m.cfg.DevBypassAuth {
-		return nil
-	}
-	if bearer == "" {
-		return ErrAuthRequired
-	}
-	if m.authCacheCheck(bearer) {
-		return nil
-	}
-	status, err := m.cp.validateKey(ctx, bearer)
-	if err != nil {
-		return err
-	}
-	switch status {
-	case http.StatusOK:
-		m.authCacheStore(bearer)
-		return nil
-	// common controlplane rejections — 401, 402, 403, 429
-	case http.StatusUnauthorized,
-		http.StatusPaymentRequired,
-		http.StatusForbidden,
-		http.StatusTooManyRequests:
-		return ErrAuthRequired
-	default:
-		return fmt.Errorf("controlplane validate-key: status %d", status)
-	}
 }
 
 func extractBearer(authHeader string) string {

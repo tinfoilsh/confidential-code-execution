@@ -13,20 +13,14 @@ import (
 	"log"
 	"net/http"
 	"time"
-
-	"github.com/tinfoilsh/verifier/client"
 )
 
-// 90s ceiling covers snapshot/restore bulk transfers; per-call /exec etc.
-// hold to the tighter toolCallTimeout via per-request ctx so a runaway
-// tool can't tie up a session for the full 90s.
+// 90s ceiling covers snapshot/restore bulk transfers; per-call
+// /exec etc. hold to the tighter toolCallTimeout via per-request ctx so
+// a runaway tool can't tie up a session for the full 90s.
 func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
-	if m.cfg.DevSkipAttestation {
-		log.Printf("orchestrator: WARNING attestation disabled (DEV_SKIP_ATTESTATION) for %s", c.Name)
-		return &http.Client{Timeout: 90 * time.Second}, nil
-	}
-	sc := client.NewSecureClient(c.Domain, m.cfg.EnvironmentRepo)
-	httpClient, err := sc.HTTPClient()
+	// attested client
+	httpClient, err := executorHTTPClient(c.Domain, m.cfg.EnvironmentRepo)
 	if err != nil {
 		return nil, err
 	}
@@ -48,7 +42,8 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		body, _ := json.Marshal(map[string]string{"error": "container unavailable: " + err.Error()})
+		log.Printf("orchestrator: proxy %s %s: %v", c.Name, path, err)
+		body, _ := json.Marshal(map[string]string{"error": "container unavailable"})
 		return 502, body, nil
 	}
 	defer resp.Body.Close()

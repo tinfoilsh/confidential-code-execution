@@ -1,3 +1,5 @@
+//go:build !dev
+
 package main
 
 // Tests for the orchestrator's api_key gate. The /api/shim/validate-key
