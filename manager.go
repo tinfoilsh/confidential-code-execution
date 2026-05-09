@@ -253,9 +253,9 @@ func (m *Manager) poolManagerLoop() {
 
 // GetOrAssign returns the session's existing container or pops one from
 // the warm pool, runs restore-on-assign, and registers it. Concurrent
-// calls for the same session serialize on a per-session mutex so they
-// share one container. Pre-assign /health filters warm containers that
-// died between the periodic check and now.
+// calls for the same session serialize on a per-session mutex.
+// Re-probes /health on the popped warm container — catches deaths
+// between health-loop ticks.
 func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnected func() bool) (*Container, string) {
 	codeExecutionEncryptionKey := sessionCodeExecutionEncryptionKey(ctx)
 	bearer := sessionBearer(ctx)
@@ -364,9 +364,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 
 	// Restore in two phases. The container's state stays exactly as it
 	// was popped from warm — no fields written until restore succeeds —
-	// so a fetch failure recycles it untouched and a push failure (which
-	// means the executor has claimed the restore token internally and
-	// the workspace may be half-extracted) destroys it.
+	// so a fetch failure recycles it untouched while push  destroys it.
 	if willRestore {
 		tarBytes, err := m.buckets.fetch(ctx, bearer, accessToken, codeExecutionEncryptionKey)
 		if err != nil {
@@ -425,8 +423,7 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 }
 
 // evictAndSnapshot snapshots the workspace to buckets (if keys are
-// cached) then deletes the container. Snapshot failures still destroy:
-// losing state is bad, leaving stale containers is worse.
+// cached) then deletes the container. Snapshot failures still destroy.
 // ctx bounds the snapshot phase — Finish passes a deadlined ctx so
 // in-flight HTTP gets cancelled when the platform grace period nears.
 func (m *Manager) evictAndSnapshot(ctx context.Context, accessToken string, c *Container) {
