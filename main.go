@@ -61,13 +61,6 @@ func envInt(key string, def int) int {
 	return def
 }
 
-func envBool(key string, def bool) bool {
-	if v, ok := os.LookupEnv(key); ok {
-		return v == "true" || v == "1" || v == "True" || v == "TRUE"
-	}
-	return def
-}
-
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -81,34 +74,28 @@ func main() {
 	}
 
 	cfg := ManagerConfig{
-		AdminAPIKey:         adminAPIKey,
-		ControlPlaneURL:     envStr("CONTROL_PLANE_URL", ""),
-		BucketsBase:         envStr("BUCKETS_BASE", ""),
-		PoolSize:            envInt("POOL_SIZE", 3),
-		MaxContainers:       envInt("MAX_CONTAINERS", 10),
-		PollInterval:        time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
-		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
-		HealthCheckInterval: time.Duration(envInt("HEALTH_CHECK_INTERVAL", 15)) * time.Second,
-		MaxHealthFailures:   envInt("MAX_HEALTH_FAILURES", 3),
-		ShutdownDeadline:    time.Duration(envInt("SHUTDOWN_DEADLINE", 25)) * time.Second,
+		AdminAPIKey:            adminAPIKey,
+		ControlPlaneURL:        envStr("CONTROL_PLANE_URL", "https://api.tinfoil.sh"),
+		BucketsBase:            envStr("BUCKETS_BASE", "https://buckets.tinfoil.sh"),
+		PoolSize:               envInt("POOL_SIZE", 3),
+		MaxContainers:          envInt("MAX_CONTAINERS", 10),
+		PollInterval:           time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
+		IdleTimeout:            time.Duration(envInt("IDLE_TIMEOUT", 60)) * time.Second,
+		EvictionPoll:           time.Duration(envInt("EVICTION_POLL", 30)) * time.Second,
+		WarmPoolWaitTimeout:    time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
+		HealthCheckInterval:    time.Duration(envInt("HEALTH_CHECK_INTERVAL", 15)) * time.Second,
+		MaxHealthFailures:      envInt("MAX_HEALTH_FAILURES", 3),
+		MaxConcurrentSnapshots: envInt("MAX_CONCURRENT_SNAPSHOTS", 4),
+		ShutdownDeadline:       time.Duration(envInt("SHUTDOWN_DEADLINE", 25)) * time.Second,
 		// Execution Environment
 		EnvironmentRepo: envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
 		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.9"),
-		// Dev
-		DevSkipAttestation: envBool("DEV_SKIP_ATTESTATION", false),
-		DevBypassAuth:      envBool("DEV_BYPASS_AUTH", false),
 	}
 
 	port := envInt("PORT", 7070)
 
 	log.Printf("orchestrator: pool=%d max=%d env=%s:%s",
 		cfg.PoolSize, cfg.MaxContainers, cfg.EnvironmentRepo, cfg.EnvironmentTag)
-	if cfg.DevSkipAttestation {
-		log.Printf("orchestrator: WARNING DEV_SKIP_ATTESTATION=true")
-	}
-	if cfg.DevBypassAuth {
-		log.Printf("orchestrator: WARNING DEV_BYPASS_AUTH=true")
-	}
 	mgr := NewManager(cfg)
 	registerPoolGauges(mgr)
 	mgr.StartPoolManager()
