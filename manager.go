@@ -517,23 +517,36 @@ func (m *Manager) evictIdleSessions() {
 			targets = append(targets, target{sid, c})
 		}
 	}
-	// Drop session entries up front but keep the assign lock so a
-	// concurrent GetOrAssign queues behind us cleanly.
-	for _, t := range targets {
-		delete(m.sessions, t.accessToken)
-	}
 	m.mu.Unlock()
 
-	// Fan out one goroutine per session — a hung executor on session A
-	// can't delay session B's snapshot. Mirrors scanSessionHealth.
 	for _, t := range targets {
-		go func(accessToken string, c *Container) {
-			m.evictAndSnapshot(context.Background(), accessToken, c)
-			m.mu.Lock()
-			delete(m.assignLocks, accessToken)
-			m.mu.Unlock()
-		}(t.accessToken, t.c)
+		m.evictSessionAsync(t.accessToken, t.c)
 	}
+}
+
+// evictSessionAsync spawns a goroutine that evicts (accessToken → c).
+// It holds the per-session assign lock through evictAndSnapshot so a
+// concurrent GetOrAssign queues behind u.
+// Re-verifies the session under m.mu so Finish / CleanupSession / a racing
+// health-eviction goroutine can't double-evict.
+func (m *Manager) evictSessionAsync(accessToken string, c *Container) {
+	sl := m.lockSession(accessToken)
+	go func() {
+		sl.Lock()
+		defer sl.Unlock()
+		m.mu.Lock()
+		cur, ok := m.sessions[accessToken]
+		if !ok || cur != c {
+			m.mu.Unlock()
+			return
+		}
+		delete(m.sessions, accessToken)
+		m.mu.Unlock()
+		m.evictAndSnapshot(context.Background(), accessToken, c)
+		m.mu.Lock()
+		delete(m.assignLocks, accessToken)
+		m.mu.Unlock()
+	}()
 }
 
 // ---------------------------------------------------------------------------
@@ -647,23 +660,7 @@ func (m *Manager) scanSessionHealth() {
 		if !m.shouldEvictForHealth(t.c, "session") {
 			continue
 		}
-		m.mu.Lock()
-		// Drop only if it's still us — racing eviction or assign-reuse
-		// could have already moved/replaced this entry.
-		cur, ok := m.sessions[t.accessToken]
-		if !ok || cur != t.c {
-			m.mu.Unlock()
-			continue
-		}
-		delete(m.sessions, t.accessToken)
-		m.mu.Unlock()
-
-		go func(accessToken string, c *Container) {
-			m.evictAndSnapshot(context.Background(), accessToken, c)
-			m.mu.Lock()
-			delete(m.assignLocks, accessToken)
-			m.mu.Unlock()
-		}(t.accessToken, t.c)
+		m.evictSessionAsync(t.accessToken, t.c)
 	}
 }
 

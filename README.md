@@ -72,22 +72,28 @@ go build .
 
 ### Environment variables
 
-| Variable           | Default                                | Notes                              |
-| ------------------ | -------------------------------------- | ---------------------------------- |
-| `ADMIN_API_KEY`    | _(required)_                           | Tinfoil controlplane bearer token  |
-| `POOL_SIZE`        | `3`                                    | Target warm pool size              |
-| `MAX_CONTAINERS`   | `10`                                   | Hard cap on concurrent containers  |
-| `PORT`             | `7070`                                 | manager listen port                |
-| `POLL_INTERVAL`    | `2`                                    | Seconds between controlplane polls |
-| `ENVIRONMENT_REPO` | `tinfoilsh/code-execution-environment` | Source repo for the executor image |
-| `ENVIRONMENT_TAG`  | `v0.0.9`                               | Image tag to deploy                |
+| Variable                   | Default                                | Notes                                                                                                     |
+| -------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `ADMIN_API_KEY`            | _(required)_                           | Tinfoil controlplane bearer token.                                                                        |
+| `CONTROL_PLANE_URL`        | `https://api.tinfoil.sh`               | Controlplane base URL (container CRUD + api_key validation).                                              |
+| `BUCKETS_BASE`             | `https://buckets.tinfoil.sh`           | Buckets base URL (encrypted snapshot store).                                                              |
+| `PORT`                     | `7070`                                 | Manager listen port.                                                                                      |
+| `POOL_SIZE`                | `3`                                    | Target warm pool size.                                                                                    |
+| `MAX_CONTAINERS`           | `10`                                   | Hard cap on concurrent containers (warm + inflight + sessions).                                           |
+| `POLL_INTERVAL`            | `2`                                    | Seconds between pool-manager ticks. Backs off up to 30s on consecutive controlplane failures.             |
+| `ENVIRONMENT_REPO`         | `tinfoilsh/code-execution-environment` | Source repo for the executor image.                                                                       |
+| `ENVIRONMENT_TAG`          | `v0.0.9`                               | Image tag to deploy.                                                                                      |
+| `IDLE_TIMEOUT`             | `60`                                   | Seconds of session inactivity before snapshot+evict.                                                      |
+| `EVICTION_POLL`            | `30`                                   | Seconds between idle-evictor scans.                                                                       |
+| `WARM_POOL_WAIT_TIMEOUT`   | `10`                                   | Seconds a `tools/call` will wait for a warm container before returning an at-capacity error.              |
+| `HEALTH_CHECK_INTERVAL`    | `15`                                   | Seconds between `/health` probes of warm and session containers.                                          |
+| `MAX_HEALTH_FAILURES`      | `3`                                    | Consecutive `/health` failures before evicting a container (warm: delete; session: snapshot then delete). |
+| `MAX_CONCURRENT_SNAPSHOTS` | `4`                                    | Cap on in-memory snapshot/restore tar buffers. Backstop against OOM under load.                           |
+| `SHUTDOWN_DEADLINE`        | `25`                                   | Seconds spent snapshotting sessions on SIGTERM before bulk-delete. Tune per platform grace period.        |
 
-|  
-| `DEV_SKIP_ATTESTATION` | `false` | Local dev only — skip enclave attestation + TLS pinning. Never set in prod. |
-| `DEV_BYPASS_AUTH` | `false` | Local dev only — skip api_key validation. Never set in prod. |
-| `HEALTH_CHECK_INTERVAL` | `15` | Seconds between `/health` probes of warm containers. |
-| `MAX_HEALTH_FAILURES` | `3` | Consecutive `/health` failures before a warm container is destroyed and replaced. |
-| `SHUTDOWN_DEADLINE` | `25` | Seconds spent snapshotting sessions on SIGTERM before bulk-delete. Tune per platform grace period. |
+Build tags:
+
+- `-tags dev` — disables enclave attestation + TLS pinning (`proxy_dev.go`) and api_key validation (`auth_dev.go`). Local dev only; never ship a binary built with this tag.
 
 ### API
 
@@ -120,8 +126,11 @@ Counters: `orchestrator_containers_created_total`,
 `..._max_containers`.
 
 On `SIGINT`/`SIGTERM` the manager snapshots every active session to
-buckets, deletes every container it owns on controlplane, then exits —
-so a deploy or local `ctrl-c` doesn't leak containers or session state.
+buckets in parallel within `SHUTDOWN_DEADLINE`, then bulk-deletes every
+container it owns on the controlplane and exits — so a deploy or local
+`ctrl-c` doesn't leak containers. Sessions whose snapshot doesn't
+finish within the deadline still get deleted; their workspace state is
+lost.
 
 ### Local visualizer
 
@@ -142,14 +151,20 @@ _in code-execution-environment repo_
 ### API
 
 ```
-POST /exec   {"command": "echo hello"}
-             → {"stdout": "hello\n", "stderr": "", "exit_code": 0}
+POST /exec     {"command": "echo hello"}
+               → {"stdout": "hello\n", "stderr": "", "exit_code": 0}
 
-POST /read   {"path": "/workspace/file.txt"}
-             → {"path": "...", "contents": "<base64>"}
+POST /read     {"path": "/workspace/file.txt"}
+               → {"path": "...", "contents": "<base64>"}
 
-POST /write  {"path": "...", "contents": "<base64>"}
-             → {"path": "...", "size": 42}
+POST /write    {"path": "...", "contents": "<base64>"}
+               → {"path": "...", "size": 42}
 
-GET  /health → {"status": "ok"}
+POST /restore  {"tar": "<base64>"}            (called by orchestrator pre-assign)
+               → {"status": "ok"}
+
+POST /snapshot {}                             (called by orchestrator on evict)
+               → {"tar": "<base64>"}          + trailer X-Snapshot-Status: ok
+
+GET  /health   → {"status": "ok"}
 ```

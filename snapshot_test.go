@@ -8,7 +8,7 @@ package main
 //     that key) and POSTs it to the fake container's /restore.
 //   - evictAndSnapshot: pulls a plaintext tar from the fake container's
 //     /snapshot and PUTs it to the fake buckets server.
-//   - Per-execSessionId serialization: two concurrent GetOrAssigns for
+//   - Per-accessToken serialization: two concurrent GetOrAssigns for
 //     the same session land on the same container.
 
 import (

@@ -181,7 +181,8 @@ func readFileLineRange(ctx context.Context, m *Manager, accessToken string, args
 	if err != nil {
 		return "", nil, 0, 0, err
 	}
-	lines = strings.Split(content, "\n")
+	// Files typically end with a trailing newline
+	lines = strings.Split(strings.TrimSuffix(content, "\n"), "\n")
 	start, end = 1, len(lines)
 	if r, ok := args["view_range"].([]any); ok && len(r) == 2 {
 		if s, ok := r[0].(float64); ok {
