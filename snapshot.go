@@ -21,6 +21,45 @@ import (
 // HTTP trailer the environment sets to "ok" once it's finished streaming.
 const snapshotTrailer = "X-Snapshot-Status"
 
+// 1 initial + 2 retries on transient (5xx or network) failures.
+const (
+	bucketFetchAttempts = 3
+	bucketPutAttempts   = 3
+	pushRestoreAttempts = 3
+)
+
+// Backoff between retries. Vars (not consts) so tests can zero them.
+var (
+	snapshotPutRetryDelay = 1 * time.Second
+	restorePushRetryDelay = 1 * time.Second
+)
+
+// httpRetry calls fn up to `attempts` times, sleeping `backoff` between
+// calls. fn returns (result, transient, err); transient=true means the
+// error is worth retrying.
+func httpRetry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, bool, error)) (T, error) {
+	var zero T
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return zero, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		result, transient, err := fn()
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !transient {
+			return zero, err
+		}
+	}
+	return zero, lastErr
+}
+
 // ---------------------------------------------------------------------------
 // Buckets — HTTP client for buckets.tinfoil.sh.
 // ---------------------------------------------------------------------------
@@ -33,7 +72,7 @@ type Buckets struct {
 func NewBuckets(baseURL string) *Buckets {
 	return &Buckets{
 		baseURL:    baseURL,
-		httpClient: &http.Client{Timeout: 120 * time.Second}, //
+		httpClient: &http.Client{Timeout: 120 * time.Second},
 	}
 }
 
@@ -47,16 +86,24 @@ func urlBase64ToStd(b64url string) (string, error) {
 	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
-// fetch returns the plaintext tar for accessToken. (nil, nil) on 403/404
-// — wrong key or no snapshot yet, both surface as a fresh workspace.
+// fetch returns the plaintext tar for accessToken. 404 yields (nil, nil)
+// (no snapshot yet). Retries transient (5xx, network) failures internally.
 func (b *Buckets) fetch(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
 	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return nil, err
 	}
+	return httpRetry(ctx, bucketFetchAttempts, restorePushRetryDelay, func() ([]byte, bool, error) {
+		return b.fetchOnce(ctx, bearer, accessToken, keyStd)
+	})
+}
+
+// fetchOnce returns (bytes, transient, err). 404 → (nil, false, nil)
+// signals "no snapshot, fall through to fresh workspace".
+func (b *Buckets) fetchOnce(ctx context.Context, bearer, accessToken, keyStd string) ([]byte, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", b.baseURL+"/items/"+accessToken, nil)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("X-Encryption-Key", keyStd)
@@ -64,35 +111,38 @@ func (b *Buckets) fetch(ctx context.Context, bearer, accessToken, codeExecutionE
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusForbidden {
-		return nil, nil
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, false, nil
+	}
+	if resp.StatusCode >= 500 {
+		return nil, true, fmt.Errorf("buckets GET: %d", resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("buckets GET: %d", resp.StatusCode)
+		return nil, false, fmt.Errorf("buckets GET: %d", resp.StatusCode)
 	}
 	raw, err := readLimited(resp.Body, maxSnapshotBody)
 	if err != nil {
-		return nil, fmt.Errorf("buckets GET body: %w", err)
+		return nil, false, fmt.Errorf("buckets GET body: %w", err)
 	}
-
 	var body struct {
 		Value string `json:"value"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, fmt.Errorf("decode bucket response: %w", err)
+		return nil, false, fmt.Errorf("decode bucket response: %w", err)
 	}
 	tarBytes, err := base64.StdEncoding.DecodeString(body.Value)
 	if err != nil {
-		return nil, fmt.Errorf("decode bucket value: %w", err)
+		return nil, false, fmt.Errorf("decode bucket value: %w", err)
 	}
-	return tarBytes, nil
+	return tarBytes, false, nil
 }
 
 // put stores the plaintext tar; buckets encrypts it under the supplied key.
+// Retries transient (5xx, network) failures internally.
 func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
 	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
@@ -105,9 +155,16 @@ func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEnc
 	if err != nil {
 		return err
 	}
+	_, err = httpRetry(ctx, bucketPutAttempts, snapshotPutRetryDelay, func() (struct{}, bool, error) {
+		return b.putOnce(ctx, bearer, accessToken, body)
+	})
+	return err
+}
+
+func (b *Buckets) putOnce(ctx context.Context, bearer, accessToken string, body []byte) (struct{}, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, "PUT", b.baseURL+"/items/"+accessToken, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return struct{}{}, false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("Content-Type", "application/json")
@@ -115,13 +172,16 @@ func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEnc
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		return err
+		return struct{}{}, true, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("buckets PUT: %d", resp.StatusCode)
+	if resp.StatusCode >= 500 {
+		return struct{}{}, true, fmt.Errorf("buckets PUT: %d", resp.StatusCode)
 	}
-	return nil
+	if resp.StatusCode >= 400 {
+		return struct{}{}, false, fmt.Errorf("buckets PUT: %d", resp.StatusCode)
+	}
+	return struct{}{}, false, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -129,35 +189,45 @@ func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEnc
 // ---------------------------------------------------------------------------
 
 // pushRestore POSTs the plaintext tar to the container's /restore.
-// Must run before any user traffic touches the container. A 403 counts
-// toward the consecutive-403s threshold via recordContainerStatus.
-func (m *Manager) pushRestore(ctx context.Context, c *Container, accessToken string, plaintextTar []byte) (int, error) {
+// Retries transient (5xx, network) failures internally. recordContainerStatus
+// is called on every attempt so 403s still count toward the threshold.
+func (m *Manager) pushRestore(ctx context.Context, c *Container, accessToken string, plaintextTar []byte) error {
 	if c.httpClient == nil {
-		return 0, fmt.Errorf("no http client for container %s", c.Name)
+		return fmt.Errorf("no http client for container %s", c.Name)
 	}
 	body, err := json.Marshal(map[string]string{
 		"tar": base64.StdEncoding.EncodeToString(plaintextTar),
 	})
 	if err != nil {
-		return 0, err
+		return err
 	}
+	_, err = httpRetry(ctx, pushRestoreAttempts, restorePushRetryDelay, func() (struct{}, bool, error) {
+		return m.pushRestoreOnce(ctx, c, accessToken, body)
+	})
+	return err
+}
+
+func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, accessToken string, body []byte) (struct{}, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+c.Domain+"/restore", bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return struct{}{}, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("restore POST: %w", err)
+		return struct{}{}, true, fmt.Errorf("restore POST: %w", err)
 	}
 	defer resp.Body.Close()
 	_, _ = readLimited(resp.Body, maxExecutorBody)
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
-	if resp.StatusCode >= 400 {
-		return resp.StatusCode, fmt.Errorf("restore returned %d", resp.StatusCode)
+	if resp.StatusCode >= 500 {
+		return struct{}{}, true, fmt.Errorf("restore returned %d", resp.StatusCode)
 	}
-	return resp.StatusCode, nil
+	if resp.StatusCode >= 400 {
+		return struct{}{}, false, fmt.Errorf("restore returned %d", resp.StatusCode)
+	}
+	return struct{}{}, false, nil
 }
 
 // Streams a plaintext tar of /workspace.

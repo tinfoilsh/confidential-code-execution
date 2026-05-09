@@ -10,8 +10,6 @@ import (
 	"time"
 )
 
-var snapshotPutRetryDelay = 1 * time.Second
-var restorePushRetryDelay = 1 * time.Second
 var toolCallTimeout = 35 * time.Second
 
 type Container struct {
@@ -62,12 +60,12 @@ type ManagerConfig struct {
 	WarmPoolWaitTimeout time.Duration
 	HealthCheckInterval time.Duration
 	MaxHealthFailures   int
+	// Caps how many snapshot/restore tar buffers can live in memory at
+	// once.
+	MaxConcurrentSnapshots int
 	// Caps Finish's session snapshot phase before bulk-delete.
 	// TODO: tune this correctly
 	ShutdownDeadline time.Duration
-	// Local dev only. Skip attestation & don't require key
-	DevSkipAttestation bool
-	DevBypassAuth      bool
 }
 
 type Manager struct {
@@ -82,38 +80,18 @@ type Manager struct {
 	finishOnce  sync.Once
 	done        chan struct{} // closed by Finish to signal shutdown
 
+	// Bearers that recently passed validate-key
 	authCacheMu sync.Mutex
-	authCache   map[string]time.Time // bearer → expiry; positive validations only
+	authCache   map[string]time.Time
+
+	// Bounds how many snapshot/restore tar buffers can be in memory concurrently.
+	snapshotSem chan struct{}
 
 	cp      *Controlplane
 	buckets *Buckets
 }
 
 func NewManager(cfg ManagerConfig) *Manager {
-	if cfg.ControlPlaneURL == "" {
-		cfg.ControlPlaneURL = "https://api.tinfoil.sh"
-	}
-	if cfg.BucketsBase == "" {
-		cfg.BucketsBase = "https://buckets.tinfoil.sh"
-	}
-	if cfg.IdleTimeout == 0 {
-		cfg.IdleTimeout = 1 * time.Minute
-	}
-	if cfg.EvictionPoll == 0 {
-		cfg.EvictionPoll = 30 * time.Second
-	}
-	if cfg.WarmPoolWaitTimeout == 0 {
-		cfg.WarmPoolWaitTimeout = 10 * time.Second
-	}
-	if cfg.HealthCheckInterval == 0 {
-		cfg.HealthCheckInterval = 15 * time.Second
-	}
-	if cfg.MaxHealthFailures == 0 {
-		cfg.MaxHealthFailures = 3
-	}
-	if cfg.ShutdownDeadline == 0 {
-		cfg.ShutdownDeadline = 25 * time.Second
-	}
 	m := &Manager{
 		cfg:         cfg,
 		cp:          NewControlplane(cfg.ControlPlaneURL, cfg.AdminAPIKey),
@@ -122,6 +100,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		assignLocks: map[string]*sync.Mutex{},
 		done:        make(chan struct{}),
 		authCache:   map[string]time.Time{},
+		snapshotSem: make(chan struct{}, cfg.MaxConcurrentSnapshots),
 	}
 	m.cond = sync.NewCond(&m.mu)
 	return m
@@ -347,8 +326,22 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		return c, ""
 	}
 	m.mu.Unlock()
-	var c *Container
 
+	// Reserve an in-memory tar slot upfront (only if we'll actually
+	// restore). At capacity, refuse before popping a warm container so the
+	// caller can retry without us churning state.
+	willRestore := codeExecutionEncryptionKey != "" && bearer != ""
+	if willRestore {
+		select {
+		case m.snapshotSem <- struct{}{}:
+		default:
+			restores.WithLabelValues("failure").Inc()
+			return nil, "server at capacity, please retry"
+		}
+		defer func() { <-m.snapshotSem }()
+	}
+
+	var c *Container
 	deadline := time.Now().Add(m.cfg.WarmPoolWaitTimeout)
 	for {
 		m.mu.Lock()
@@ -386,62 +379,50 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		go m.cp.deleteContainer(candidate.ID)
 	}
 
+	// Restore in two phases. The container's state stays exactly as it
+	// was popped from warm — no fields written until restore succeeds —
+	// so a fetch failure recycles it untouched and a push failure (which
+	// means the executor has claimed the restore token internally and
+	// the workspace may be half-extracted) destroys it.
+	if willRestore {
+		tarBytes, err := m.buckets.fetch(ctx, bearer, accessToken, codeExecutionEncryptionKey)
+		if err != nil {
+			restores.WithLabelValues("failure").Inc()
+			m.mu.Lock()
+			m.warmPool = append(m.warmPool, c)
+			m.cond.Broadcast()
+			m.mu.Unlock()
+			return nil, fmt.Sprintf("fetch snapshot: %v", err)
+		}
+		if tarBytes == nil {
+			restores.WithLabelValues("empty").Inc()
+		} else {
+			if err := m.pushRestore(ctx, c, accessToken, tarBytes); err != nil {
+				restores.WithLabelValues("failure").Inc()
+				c.setStatus("failed")
+				go m.cp.deleteContainer(c.ID)
+				return nil, fmt.Sprintf("push restore: %v", err)
+			}
+			restores.WithLabelValues("success").Inc()
+		}
+	}
+
+	// Commit assigned state in one shot, only after restore has succeeded or skippped.
+	// Until this point the container looked identical to a warm-pool entry
 	now := time.Now()
 	c.mu.Lock()
-	c.Status = "assigning"
+	c.Status = "assigned"
 	c.AssignedAt = now
 	c.LastActivity = now
-	if codeExecutionEncryptionKey != "" {
-		c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
-	}
-	if bearer != "" {
-		c.Bearer = bearer
-	}
+	c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
+	c.Bearer = bearer
 	c.mu.Unlock()
-
-	// Restore failures fall through to a fresh empty workspace — better
-	// than refusing to assign and breaking the user's chat.
-	if codeExecutionEncryptionKey != "" && bearer != "" {
-		_ = m.restoreInto(ctx, bearer, accessToken, c, codeExecutionEncryptionKey)
-	}
-
-	// Mark assigned only AFTER restore so the eviction loop can't trip
-	// on a half-bootstrapped container.
-	c.setStatus("assigned")
 	m.mu.Lock()
 	m.sessions[accessToken] = c
 	m.mu.Unlock()
 	assigned = true
 
 	return c, ""
-}
-
-// restoreInto fetches the snapshot for accessToken from buckets and
-// pushes the plaintext tar into the container's /restore. Empty bucket
-// or unreadable-with-this-key both surface as a fresh workspace.
-func (m *Manager) restoreInto(ctx context.Context, bearer, accessToken string, c *Container, codeExecutionEncryptionKeyB64 string) error {
-	tarBytes, err := m.buckets.fetch(ctx, bearer, accessToken, codeExecutionEncryptionKeyB64)
-	if err != nil {
-		restores.WithLabelValues("failure").Inc()
-		return fmt.Errorf("fetch snapshot: %w", err)
-	}
-	if tarBytes == nil {
-		restores.WithLabelValues("empty").Inc()
-		return nil
-	}
-	// One retry on transient (5xx, network). 4xx (incl. 403 token
-	// mismatch, 410 window closed) won't recover — bail.
-	status, err := m.pushRestore(ctx, c, accessToken, tarBytes)
-	if err != nil && (status == 0 || status >= 500) {
-		time.Sleep(restorePushRetryDelay)
-		_, err = m.pushRestore(ctx, c, accessToken, tarBytes)
-	}
-	if err != nil {
-		restores.WithLabelValues("failure").Inc()
-		return fmt.Errorf("push restore: %w", err)
-	}
-	restores.WithLabelValues("success").Inc()
-	return nil
 }
 
 func (m *Manager) CleanupSession(accessToken string) *Container {
@@ -474,23 +455,24 @@ func (m *Manager) evictAndSnapshot(ctx context.Context, accessToken string, c *C
 	case key == "", bearer == "":
 		snapshots.WithLabelValues("skipped").Inc()
 	default:
+		// Unbounded wait on evictIdle, bounded wait on Finish
+		select {
+		case m.snapshotSem <- struct{}{}:
+		case <-ctx.Done():
+			snapshots.WithLabelValues("skipped").Inc()
+			c.setStatus("deleting")
+			m.cp.deleteContainer(c.ID)
+			return
+		}
 		tarBytes, err := m.fetchSnapshotFromContainer(ctx, c, accessToken)
 		if err != nil {
 			snapshots.WithLabelValues("failure").Inc()
+		} else if err := m.buckets.put(ctx, bearer, accessToken, key, tarBytes); err != nil {
+			snapshots.WithLabelValues("failure").Inc()
 		} else {
-			// One retry on transient PUT failure: a single buckets blip
-			// shouldn't cost a user their workspace.
-			putErr := m.buckets.put(ctx, bearer, accessToken, key, tarBytes)
-			if putErr != nil {
-				time.Sleep(snapshotPutRetryDelay)
-				putErr = m.buckets.put(ctx, bearer, accessToken, key, tarBytes)
-			}
-			if putErr != nil {
-				snapshots.WithLabelValues("failure").Inc()
-			} else {
-				snapshots.WithLabelValues("success").Inc()
-			}
+			snapshots.WithLabelValues("success").Inc()
 		}
+		<-m.snapshotSem
 	}
 	c.setStatus("deleting")
 	m.cp.deleteContainer(c.ID)
