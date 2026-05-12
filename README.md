@@ -112,6 +112,40 @@ Methods:
 Tools: bash, view, present, str_replace, create, insert
 ```
 
+#### curl
+
+`initialize` and `tools/list` need no headers:
+
+```bash
+curl -s -X POST localhost:7070/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+curl -s -X POST localhost:7070/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+`tools/call` requires two 64-hex session tokens and a user api_key as the
+`Authorization` bearer (validated against the controlplane; in `-tags dev`
+builds the validation is skipped but the bearer is still used for buckets
+auth on snapshot/restore):
+
+```bash
+# Generat an access token w/ openssl rand -hex 32
+# Can use a random auth token for testing
+
+curl -s -X POST localhost:7070/mcp \
+  -H 'Content-Type: application/json' \
+  -H "X-Code-Execution-Access-Token: $ACCESS_TOKEN" \
+  -H "X-Code-Execution-Container-Auth-Token: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+  -H "Authorization: Bearer $TINFOIL_API_KEY" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bash","arguments":{"command":"echo hello from sandbox; uname -a"}}}'
+```
+
+Reuse the same `X-Code-Execution-Access-Token` across calls to hit the
+same session (state persists in `/workspace`).
+
 Other endpoints:
 
 ```
