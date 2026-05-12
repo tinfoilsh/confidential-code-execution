@@ -247,7 +247,7 @@ func sessionBearer(ctx context.Context) string {
 	return v
 }
 
-// Unlike the bearer / encryption key, this value is never cached
+// Per-request only
 func WithContainerAuthToken(ctx context.Context, token string) context.Context {
 	if token != "" {
 		ctx = context.WithValue(ctx, ctxKeyContainerAuthToken, token)

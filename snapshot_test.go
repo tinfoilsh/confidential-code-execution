@@ -397,7 +397,7 @@ func TestFetchSnapshotRejectsTruncatedStream(t *testing.T) {
 	c := fakeContainer(fc)
 
 	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
-	_, err := m.fetchSnapshotFromContainer(context.Background(), c, "sess-truncated")
+	_, err := m.fetchSnapshotFromContainer(context.Background(), c)
 	if err == nil {
 		t.Fatalf("expected error on missing snapshot trailer, got nil")
 	}
