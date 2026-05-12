@@ -1,23 +1,12 @@
 package main
 
-// Orchestrator-side snapshot/restore helpers.
+// Snapshot & restore a container's filesystem.
+// The bucket service handles encryption end-to-end. We pass plaintext, accessToken, encryption key, api key
 //
-// The bucket service
-// handles encryption end-to-end: callers pass plaintext + a 32-byte
-// symmetric key, the bucket encrypts under the key
-// and persists ciphertext in R2. We never see ciphertext.
-//
-// Flow:
-//
-//   1. on resume: GET /items/{accessToken} from buckets with the user's
-//      X-Encryption-Key, get plaintext tar back, push it into the fresh
-//      container's /restore endpoint before exposing it.
-//   2. on eviction: ask the container for a plaintext tar (its /snapshot
-//      now returns plaintext — encryption is upstream), PUT it to
-//      /items/{accessToken} with the cached exec key, then destroy the
-//      container.
-//
-// The container never sees the key; the orchestrator never sees ciphertext.
+//   1. resume: GET /items/{accessToken} from buckets, push plaintext
+//      tar to the fresh container's /restore before user traffic hits it.
+//   2. snapshot: ask the container for a plaintext tar at /snapshot,
+//      PUT to /items/{accessToken}, then destroy the container.
 
 import (
 	"bytes"
@@ -25,145 +14,139 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
+	"time"
 )
 
-// bucketsBase is the tinfoil-buckets root. Override via env in main.go.
-var bucketsBase = "https://buckets.tinfoil.sh"
+// HTTP trailer the environment sets to "ok" once it's finished streaming.
+const snapshotTrailer = "X-Snapshot-Status"
 
-// ctxKeyCodeExecutionEncryptionKey carries the user's symmetric Code
-// Execution Encryption Key down the call chain. The MCP boundary reads
-// X-Code-Execution-Encryption-Key from the request and stashes it here;
-// GetOrAssign and the eviction path read it back. Lifetime is bounded by
-// the request goroutine — when the handler returns, the context is gone,
-// so a stale key can't leak into a later request.
-type ctxKey int
-
+// 1 initial + 2 retries on transient (5xx or network) failures.
 const (
-	ctxKeyCodeExecutionEncryptionKey ctxKey = iota
-	ctxKeyBearer
+	bucketFetchAttempts = 3
+	bucketPutAttempts   = 3
+	pushRestoreAttempts = 3
 )
 
-// WithCodeExecutionEncryptionKey returns a child context carrying the
-// user's Code Execution Encryption Key. Empty values are not stored.
-func WithCodeExecutionEncryptionKey(ctx context.Context, key string) context.Context {
-	if key != "" {
-		ctx = context.WithValue(ctx, ctxKeyCodeExecutionEncryptionKey, key)
-	}
-	return ctx
-}
+// Backoff between retries. Vars (not consts) so tests can zero them.
+var (
+	snapshotPutRetryDelay = 1 * time.Second
+	restorePushRetryDelay = 1 * time.Second
+)
 
-func sessionCodeExecutionEncryptionKey(ctx context.Context) string {
-	v, _ := ctx.Value(ctxKeyCodeExecutionEncryptionKey).(string)
-	return v
-}
-
-// WithBearer returns a child context carrying the api_key bearer. Empty
-// values are not stored. Read by GetOrAssign and the eviction path so
-// buckets calls can authenticate and resolve the storage prefix.
-func WithBearer(ctx context.Context, bearer string) context.Context {
-	if bearer != "" {
-		ctx = context.WithValue(ctx, ctxKeyBearer, bearer)
-	}
-	return ctx
-}
-
-func sessionBearer(ctx context.Context) string {
-	v, _ := ctx.Value(ctxKeyBearer).(string)
-	return v
-}
-
-// decodeBase64Lenient accepts std, raw-std, url, or raw-url base64.
-// Webapp headers tend to be url-safe with no padding; std-encoded values
-// show up on the bucket wire format. Lets callers stay agnostic.
-func decodeBase64Lenient(s string) ([]byte, error) {
-	for _, enc := range []*base64.Encoding{
-		base64.StdEncoding,
-		base64.RawStdEncoding,
-		base64.URLEncoding,
-		base64.RawURLEncoding,
-	} {
-		if b, err := enc.DecodeString(s); err == nil {
-			return b, nil
+// httpRetry calls fn up to `attempts` times, sleeping `backoff` between
+// calls. fn returns (result, transient, err); transient=true means the
+// error is worth retrying.
+func httpRetry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, bool, error)) (T, error) {
+	var zero T
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return zero, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		result, transient, err := fn()
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !transient {
+			return zero, err
 		}
 	}
-	return nil, fmt.Errorf("not valid base64")
+	return zero, lastErr
 }
 
-// toStdBase64 normalizes any base64 variant to std (with padding).
-// Buckets only accepts std base64 in JSON bodies and the X-Encryption-Key
-// header, so we convert at the wire boundary.
-func toStdBase64(s string) (string, error) {
-	raw, err := decodeBase64Lenient(s)
+// ---------------------------------------------------------------------------
+// Buckets — HTTP client for buckets.tinfoil.sh.
+// ---------------------------------------------------------------------------
+
+type Buckets struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+func NewBuckets(baseURL string) *Buckets {
+	return &Buckets{
+		baseURL:    baseURL,
+		httpClient: &http.Client{Timeout: 120 * time.Second},
+	}
+}
+
+// urlBase64ToStd converts the webapp's url-safe-no-padding key
+// (idiomatic JS) to std-base64 — what buckets expects.
+func urlBase64ToStd(b64url string) (string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(b64url)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("decode encryption key: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(raw), nil
 }
 
-// fetchSnapshotTar pulls the plaintext tar for accessToken from buckets.
-// Returns (nil, nil) when the bucket has no entry for this accessToken
-// (404), or when the supplied key can't open the entry (403 — wrong
-// key or corrupt envelope). Both cases are non-fatal: GetOrAssign
-// proceeds with a fresh empty workspace.
-//
-// The bearer is the user's api_key — buckets resolves it to the owning
-// (user_id, org_id) and uses that as the R2 storage prefix.
-func (m *Manager) fetchSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
-	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
-	if err != nil {
-		return nil, fmt.Errorf("decode code execution encryption key: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, "GET", bucketsBase+"/items/"+accessToken, nil)
+// fetch returns the plaintext tar for accessToken. 404 yields (nil, nil)
+// (no snapshot yet). Retries transient (5xx, network) failures internally.
+func (b *Buckets) fetch(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string) ([]byte, error) {
+	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
 		return nil, err
+	}
+	return httpRetry(ctx, bucketFetchAttempts, restorePushRetryDelay, func() ([]byte, bool, error) {
+		return b.fetchOnce(ctx, bearer, accessToken, keyStd)
+	})
+}
+
+// fetchOnce returns (bytes, transient, err). 404 → (nil, false, nil)
+// signals "no snapshot, fall through to fresh workspace".
+func (b *Buckets) fetchOnce(ctx context.Context, bearer, accessToken, keyStd string) ([]byte, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", b.baseURL+"/items/"+accessToken, nil)
+	if err != nil {
+		return nil, false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("X-Encryption-Key", keyStd)
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
 
-	resp, err := m.apiClient.Do(req)
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, true, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
+		return nil, false, nil
 	}
-	if resp.StatusCode == http.StatusForbidden {
-		// Wrong key or corrupt envelope. Caller logs and starts fresh.
-		return nil, nil
+	if resp.StatusCode >= 500 {
+		return nil, true, fmt.Errorf("buckets GET: %d", resp.StatusCode)
 	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("buckets GET %s: %d %s", accessToken, resp.StatusCode, string(raw))
+		return nil, false, fmt.Errorf("buckets GET: %d", resp.StatusCode)
 	}
-
+	raw, err := readLimited(resp.Body, maxSnapshotBody)
+	if err != nil {
+		return nil, false, fmt.Errorf("buckets GET body: %w", err)
+	}
 	var body struct {
 		Value string `json:"value"`
 	}
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, fmt.Errorf("decode bucket response: %w", err)
+		return nil, false, fmt.Errorf("decode bucket response: %w", err)
 	}
 	tarBytes, err := base64.StdEncoding.DecodeString(body.Value)
 	if err != nil {
-		return nil, fmt.Errorf("decode bucket value: %w", err)
+		return nil, false, fmt.Errorf("decode bucket value: %w", err)
 	}
-	return tarBytes, nil
+	return tarBytes, false, nil
 }
 
-// putSnapshotTar PUTs the plaintext tar to buckets, encrypting under the
-// supplied Code Execution Encryption Key. Buckets generates a fresh DEK
-// per PUT (envelope v1) and wraps it under the supplied key.
-//
-// The bearer is the user's api_key — buckets resolves it to the owning
-// (user_id, org_id) and uses that as the R2 storage prefix.
-func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
-	keyStd, err := toStdBase64(codeExecutionEncryptionKeyB64)
+// put stores the plaintext tar; buckets encrypts it under the supplied key.
+// Retries transient (5xx, network) failures internally.
+func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEncryptionKeyB64 string, tarBytes []byte) error {
+	keyStd, err := urlBase64ToStd(codeExecutionEncryptionKeyB64)
 	if err != nil {
-		return fmt.Errorf("decode code execution encryption key: %w", err)
+		return err
 	}
 	body, err := json.Marshal(map[string]any{
 		"value":           base64.StdEncoding.EncodeToString(tarBytes),
@@ -172,76 +155,89 @@ func (m *Manager) putSnapshotTar(ctx context.Context, bearer, accessToken, codeE
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, "PUT", bucketsBase+"/items/"+accessToken, bytes.NewReader(body))
+	_, err = httpRetry(ctx, bucketPutAttempts, snapshotPutRetryDelay, func() (struct{}, bool, error) {
+		return b.putOnce(ctx, bearer, accessToken, body)
+	})
+	return err
+}
+
+func (b *Buckets) putOnce(ctx context.Context, bearer, accessToken string, body []byte) (struct{}, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, "PUT", b.baseURL+"/items/"+accessToken, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return struct{}{}, false, err
 	}
 	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
 
-	resp, err := m.apiClient.Do(req)
+	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		return err
+		return struct{}{}, true, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("buckets PUT %s: %d %s", accessToken, resp.StatusCode, string(raw))
+	if resp.StatusCode >= 500 {
+		return struct{}{}, true, fmt.Errorf("buckets PUT: %d", resp.StatusCode)
 	}
-	return nil
+	if resp.StatusCode >= 400 {
+		return struct{}{}, false, fmt.Errorf("buckets PUT: %d", resp.StatusCode)
+	}
+	return struct{}{}, false, nil
 }
 
-// pushRestore POSTs the plaintext tar to the container's /restore endpoint.
-// This only succeeds during the startup window — the executor's api-server
-// closes the gate after the first non-/restore call, so we MUST call this
-// before any user traffic touches the container.
-//
-// Body shape matches executor/snapshot.go's restoreRequest: {tar: <base64>}.
-// The api-server token gate also gets its first claim from this call when
-// there's a snapshot to restore; on a 403 the recordContainerStatus path
-// counts toward the consecutive-403s threshold like any other call.
-//
-// Returns (status, err). status is 0 when the request never produced an
-// HTTP response (transport-level failure). The caller uses status to
-// decide whether a retry is worth attempting — 4xx isn't, 5xx and 0 are.
-func (m *Manager) pushRestore(c *Container, accessToken string, plaintextTar []byte) (int, error) {
+// ---------------------------------------------------------------------------
+// Executor /restore + /snapshot — hits the per-container attested client.
+// ---------------------------------------------------------------------------
+
+// pushRestore POSTs the plaintext tar to the container's /restore.
+// Retries transient (5xx, network) failures internally. recordContainerStatus
+// is called on every attempt so 403s still count toward the threshold.
+func (m *Manager) pushRestore(ctx context.Context, c *Container, accessToken string, plaintextTar []byte) error {
 	if c.httpClient == nil {
-		return 0, fmt.Errorf("no http client for container %s", c.Name)
+		return fmt.Errorf("no http client for container %s", c.Name)
 	}
 	body, err := json.Marshal(map[string]string{
 		"tar": base64.StdEncoding.EncodeToString(plaintextTar),
 	})
 	if err != nil {
-		return 0, err
+		return err
 	}
-	req, err := http.NewRequest("POST", "https://"+c.Domain+"/restore", bytes.NewReader(body))
+	_, err = httpRetry(ctx, pushRestoreAttempts, restorePushRetryDelay, func() (struct{}, bool, error) {
+		return m.pushRestoreOnce(ctx, c, accessToken, body)
+	})
+	return err
+}
+
+func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, accessToken string, body []byte) (struct{}, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+c.Domain+"/restore", bytes.NewReader(body))
 	if err != nil {
-		return 0, err
+		return struct{}{}, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("restore POST: %w", err)
+		return struct{}{}, true, fmt.Errorf("restore POST: %w", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	_, _ = readLimited(resp.Body, maxExecutorBody)
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
-	if resp.StatusCode >= 400 {
-		return resp.StatusCode, fmt.Errorf("restore returned %d: %s", resp.StatusCode, string(data))
+	if resp.StatusCode >= 500 {
+		return struct{}{}, true, fmt.Errorf("restore returned %d", resp.StatusCode)
 	}
-	return resp.StatusCode, nil
+	if resp.StatusCode >= 400 {
+		return struct{}{}, false, fmt.Errorf("restore returned %d", resp.StatusCode)
+	}
+	return struct{}{}, false, nil
 }
 
-// fetchSnapshotFromContainer asks the running container for a plaintext
-// tar of /workspace. Used on eviction. Encryption is handled by buckets,
-// not the container, so the container response is just {tar: <base64>}.
-func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) ([]byte, error) {
+// Streams a plaintext tar of /workspace.
+// Clean stream is signaled by the X-Snapshot-Status: ok HTTP trailer;
+// 200 with the trailer absent or != "ok" means there was a problem.
+func (m *Manager) fetchSnapshotFromContainer(ctx context.Context, c *Container, accessToken string) ([]byte, error) {
 	if c.httpClient == nil {
 		return nil, fmt.Errorf("no http client for container %s", c.Name)
 	}
-	req, err := http.NewRequest("POST", "https://"+c.Domain+"/snapshot", bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+c.Domain+"/snapshot", bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, err
 	}
@@ -252,10 +248,17 @@ func (m *Manager) fetchSnapshotFromContainer(c *Container, accessToken string) (
 		return nil, fmt.Errorf("snapshot POST: %w", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, readErr := readLimited(resp.Body, maxSnapshotBody)
 	m.recordContainerStatus(accessToken, c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("snapshot returned %d: %s", resp.StatusCode, string(data))
+		return nil, fmt.Errorf("snapshot returned %d", resp.StatusCode)
+	}
+	if readErr != nil {
+		return nil, fmt.Errorf("read snapshot stream: %w", readErr)
+	}
+	// resp.Trailer is only populated after the body has been fully read.
+	if got := resp.Trailer.Get(snapshotTrailer); got != "ok" {
+		return nil, fmt.Errorf("snapshot stream incomplete: trailer %s=%q", snapshotTrailer, got)
 	}
 	var body struct {
 		Tar string `json:"tar"`

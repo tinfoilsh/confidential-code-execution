@@ -2,17 +2,18 @@
 //
 // Thin HTTP server that routes:
 //
-//	POST /mcp        → MCP handler (primary tool interface)
-//	GET  /health     → health check
-//	GET  /metrics    → detailed metrics for viz.py
-//	POST /cleanup    → release a single session
-//	POST /delete-all → delete all containers
-//	POST /finish     → delete all + shutdown
+//	POST /mcp     → MCP handler (primary tool interface)
+//	GET  /metrics → Prometheus scrape (aggregate counters/gauges only)
+//
+// On SIGINT/SIGTERM the orchestrator snapshots every active session to
+// buckets & deletes every container it owns
 package main
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -20,7 +21,29 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// Snapshot cap covers /workspace tmpfs (512 MB) → ~683 MB after base64.
+const (
+	maxMCPRequestBody   = 1 << 20  // 1 MB
+	maxControlplaneBody = 1 << 20  // 1 MB
+	maxExecutorBody     = 16 << 20 // 16 MB
+	maxSnapshotBody     = 1 << 30  // 1 GB
+)
+
+// readLimited errors if r exceeds max, instead of silently truncating.
+func readLimited(r io.Reader, max int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return data, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("response exceeds %d bytes", max)
+	}
+	return data, nil
+}
 
 func envStr(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok {
@@ -38,13 +61,6 @@ func envInt(key string, def int) int {
 	return def
 }
 
-func envBool(key string, def bool) bool {
-	if v, ok := os.LookupEnv(key); ok {
-		return v == "true" || v == "1" || v == "True" || v == "TRUE"
-	}
-	return def
-}
-
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -58,68 +74,40 @@ func main() {
 	}
 
 	cfg := ManagerConfig{
-		AdminAPIKey:         adminAPIKey,
-		PoolSize:            envInt("POOL_SIZE", 3),
-		MaxContainers:       envInt("MAX_CONTAINERS", 10),
-		PollInterval:        time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
-		ConfigRepo:          envStr("CONFIG_REPO", "tinfoilsh/code-execution-environment"),
-		ConfigTag:           envStr("CONFIG_TAG", "v0.0.9"),
-		DebugMode:           envBool("DEBUG_MODE", true),
-		VerifyAttestation:   envBool("VERIFY_ATTESTATION", false),
-		SkipJWTValidation:   envBool("SKIP_JWT_VALIDATION", true),
-		WarmPoolWaitTimeout: time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
+		AdminAPIKey:            adminAPIKey,
+		ControlPlaneURL:        envStr("CONTROL_PLANE_URL", "https://api.tinfoil.sh"),
+		BucketsBase:            envStr("BUCKETS_BASE", "https://buckets.tinfoil.sh"),
+		PoolSize:               envInt("POOL_SIZE", 3),
+		MaxContainers:          envInt("MAX_CONTAINERS", 10),
+		PollInterval:           time.Duration(envInt("POLL_INTERVAL", 2)) * time.Second,
+		IdleTimeout:            time.Duration(envInt("IDLE_TIMEOUT", 60)) * time.Second,
+		EvictionPoll:           time.Duration(envInt("EVICTION_POLL", 30)) * time.Second,
+		WarmPoolWaitTimeout:    time.Duration(envInt("WARM_POOL_WAIT_TIMEOUT", 10)) * time.Second,
+		HealthCheckInterval:    time.Duration(envInt("HEALTH_CHECK_INTERVAL", 15)) * time.Second,
+		MaxHealthFailures:      envInt("MAX_HEALTH_FAILURES", 3),
+		MaxConcurrentSnapshots: envInt("MAX_CONCURRENT_SNAPSHOTS", 4),
+		ShutdownDeadline:       time.Duration(envInt("SHUTDOWN_DEADLINE", 25)) * time.Second,
+		// Execution Environment
+		EnvironmentRepo: envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
+		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.9"),
 	}
 
-	// Snapshot storage lives at tinfoil-buckets. Default points at prod;
-	// override for local dev or staging via BUCKETS_BASE.
-	bucketsBase = envStr("BUCKETS_BASE", bucketsBase)
 	port := envInt("PORT", 7070)
 
-	log.Printf("orchestrator: pool_size=%d max_containers=%d poll_interval=%v debug=%v verify_attestation=%v",
-		cfg.PoolSize, cfg.MaxContainers, cfg.PollInterval, cfg.DebugMode, cfg.VerifyAttestation)
-	log.Printf("orchestrator: repo=%s tag=%s", cfg.ConfigRepo, cfg.ConfigTag)
+	log.Printf("orchestrator: pool=%d max=%d env=%s:%s",
+		cfg.PoolSize, cfg.MaxContainers, cfg.EnvironmentRepo, cfg.EnvironmentTag)
 	mgr := NewManager(cfg)
+	registerPoolGauges(mgr)
 	mgr.StartPoolManager()
 	mgr.StartEvictionLoop()
+	mgr.StartHealthCheckLoop()
 
 	mux := http.NewServeMux()
 	srv := &http.Server{Addr: ":" + strconv.Itoa(port), Handler: mux}
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.HealthInfo())
-	})
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.MetricsInfo())
-	})
-	mux.HandleFunc("/cleanup", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			AccessToken string `json:"codeExecutionAccessToken"`
-		}
-		json.NewDecoder(r.Body).Decode(&body)
-		if body.AccessToken == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "codeExecutionAccessToken is required"})
-			return
-		}
-		c := mgr.CleanupSession(body.AccessToken)
-		if c == nil {
-			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no session found for " + body.AccessToken})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "cleaned up", "container": c.Name})
-	})
-	mux.HandleFunc("/delete-all", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.CleanupAll())
-	})
-	mux.HandleFunc("/finish", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, mgr.Finish())
-		go func() {
-			time.Sleep(100 * time.Millisecond)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			srv.Shutdown(ctx)
-		}()
-	})
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxMCPRequestBody)
 		var req jsonRPCRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})

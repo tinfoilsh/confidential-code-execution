@@ -8,7 +8,7 @@ package main
 //     that key) and POSTs it to the fake container's /restore.
 //   - evictAndSnapshot: pulls a plaintext tar from the fake container's
 //     /snapshot and PUTs it to the fake buckets server.
-//   - Per-execSessionId serialization: two concurrent GetOrAssigns for
+//   - Per-accessToken serialization: two concurrent GetOrAssigns for
 //     the same session land on the same container.
 
 import (
@@ -27,33 +27,12 @@ import (
 	"time"
 )
 
-func TestDecodeBase64Lenient(t *testing.T) {
-	want := []byte{0x01, 0x02, 0x03, 0x04, 0xfe, 0xff}
-	for name, enc := range map[string]*base64.Encoding{
-		"std":     base64.StdEncoding,
-		"raw-std": base64.RawStdEncoding,
-		"url":     base64.URLEncoding,
-		"raw-url": base64.RawURLEncoding,
-	} {
-		got, err := decodeBase64Lenient(enc.EncodeToString(want))
-		if err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("%s: round trip mismatch", name)
-		}
-	}
-	if _, err := decodeBase64Lenient("$$$not-base64$$$"); err == nil {
-		t.Fatalf("expected error on garbage input")
-	}
-}
-
-func TestToStdBase64ConvertsURL(t *testing.T) {
+func TestURLBase64ToStd(t *testing.T) {
 	want := []byte{0xfa, 0xfb, 0xfc, 0xfd}
 	urlForm := base64.RawURLEncoding.EncodeToString(want)
-	std, err := toStdBase64(urlForm)
+	std, err := urlBase64ToStd(urlForm)
 	if err != nil {
-		t.Fatalf("toStdBase64: %v", err)
+		t.Fatalf("urlBase64ToStd: %v", err)
 	}
 	got, err := base64.StdEncoding.DecodeString(std)
 	if err != nil {
@@ -66,12 +45,18 @@ func TestToStdBase64ConvertsURL(t *testing.T) {
 
 // fakeContainerServer stands in for a code-execution-environment
 // container. /restore records what plaintext tar arrives; /snapshot
-// returns a canned plaintext tar.
+// streams a canned plaintext tar with the success trailer; /health
+// returns whatever healthStatus is set to.
 type fakeContainerServer struct {
 	*httptest.Server
 	mu             sync.Mutex
 	gotRestoreTar  []byte
 	snapshotTarB64 string
+	// snapshotOmitTrailer mirrors a truncated stream: handler sends
+	// the JSON body but never sets X-Snapshot-Status=ok.
+	snapshotOmitTrailer bool
+	// healthStatus is the status code returned by /health. 0 means 200.
+	healthStatus int
 }
 
 func newFakeContainer(snapshotTar []byte) *fakeContainerServer {
@@ -100,7 +85,24 @@ func newFakeContainer(snapshotTar []byte) *fakeContainerServer {
 	})
 	mux.HandleFunc("/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Trailer", snapshotTrailer)
+		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"tar": f.snapshotTarB64})
+		f.mu.Lock()
+		omit := f.snapshotOmitTrailer
+		f.mu.Unlock()
+		if !omit {
+			w.Header().Set(snapshotTrailer, "ok")
+		}
+	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		s := f.healthStatus
+		f.mu.Unlock()
+		if s == 0 {
+			s = http.StatusOK
+		}
+		w.WriteHeader(s)
 	})
 	f.Server = httptest.NewServer(mux)
 	return f
@@ -223,10 +225,6 @@ func TestRestoreOnAssign(t *testing.T) {
 
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	// Pre-load the bucket with a snapshot for sess-1, encrypted under
 	// the user's key. (fake bucket stores std-base64 of the key.)
 	keyRaw := bytes.Repeat([]byte{0xab}, 32)
@@ -240,7 +238,7 @@ func TestRestoreOnAssign(t *testing.T) {
 	defer fc.Close()
 	c := fakeContainer(fc)
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 1, MaxContainers: 4, IdleTimeout: time.Hour})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, PoolSize: 1, MaxContainers: 4, MaxConcurrentSnapshots: 4, IdleTimeout: time.Hour})
 	m.warmPool = []*Container{c}
 
 	// Webapp sends url-safe base64; orchestrator should normalize.
@@ -267,15 +265,11 @@ func TestRestoreOnAssignNoSnapshot(t *testing.T) {
 	// No snapshot in buckets → 404 → fresh container, /restore not called.
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	fc := newFakeContainer(nil)
 	defer fc.Close()
 	c := fakeContainer(fc)
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 1, MaxContainers: 4, IdleTimeout: time.Hour})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, PoolSize: 1, MaxContainers: 4, MaxConcurrentSnapshots: 4, IdleTimeout: time.Hour})
 	m.warmPool = []*Container{c}
 
 	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x42}, 32))
@@ -301,18 +295,14 @@ func TestEvictAndSnapshot(t *testing.T) {
 	c := fakeContainer(fc)
 
 	keyURL := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
-	keyStd, _ := toStdBase64(keyURL)
+	keyStd, _ := urlBase64ToStd(keyURL)
 	c.CodeExecutionEncryptionKey = keyURL
 	c.Bearer = "tk_test"
 
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
-	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
-	m.evictAndSnapshot("sess-evict", c)
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, MaxConcurrentSnapshots: 4})
+	m.evictAndSnapshot(context.Background(), "sess-evict", c)
 
 	bk.mu.Lock()
 	stored, ok := bk.stored["sess-evict"]
@@ -339,16 +329,12 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	bk := newFakeBuckets()
 	bk.putFailuresRemaining = 1
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	prevDelay := snapshotPutRetryDelay
 	snapshotPutRetryDelay = 0
 	defer func() { snapshotPutRetryDelay = prevDelay }()
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
-	m.evictAndSnapshot("sess-retry", c)
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, MaxConcurrentSnapshots: 4})
+	m.evictAndSnapshot(context.Background(), "sess-retry", c)
 
 	bk.mu.Lock()
 	attempts := bk.putAttempts
@@ -362,16 +348,105 @@ func TestEvictAndSnapshotPutRetry(t *testing.T) {
 	}
 }
 
+func TestFinishSnapshotsActiveSessions(t *testing.T) {
+	// Shutdown must take the same snapshot-then-delete path as idle eviction
+	// for any session with a cached key+bearer. Anything that doesn't get
+	// snapshotted on shutdown is workspace state lost on the next deploy.
+	plainTar := []byte("session-tar-bytes")
+	fc := newFakeContainer(plainTar)
+	defer fc.Close()
+	c := fakeContainer(fc)
+	c.CodeExecutionEncryptionKey = base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0x33}, 32))
+	c.Bearer = "tk_test"
+
+	bk := newFakeBuckets()
+	defer bk.Close()
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, MaxConcurrentSnapshots: 4, ShutdownDeadline: 5 * time.Second})
+	m.sessions["sess-shutdown"] = c
+
+	m.Finish()
+
+	bk.mu.Lock()
+	stored, ok := bk.stored["sess-shutdown"]
+	bk.mu.Unlock()
+	if !ok {
+		t.Fatalf("expected snapshot PUT on shutdown")
+	}
+	if !bytes.Equal(stored.plaintext, plainTar) {
+		t.Fatalf("snapshot plaintext mismatch")
+	}
+
+	m.mu.Lock()
+	left := len(m.sessions)
+	m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("expected sessions drained, got %d", left)
+	}
+}
+
+func TestFetchSnapshotRejectsTruncatedStream(t *testing.T) {
+	// /snapshot returns 200 + body but no X-Snapshot-Status trailer —
+	// mirrors the executor hitting a walk error mid-tar. The orchestrator
+	// must refuse the result so we don't PUT a half-baked snapshot.
+	fc := newFakeContainer([]byte("partial-tar"))
+	fc.mu.Lock()
+	fc.snapshotOmitTrailer = true
+	fc.mu.Unlock()
+	defer fc.Close()
+	c := fakeContainer(fc)
+
+	m := NewManager(ManagerConfig{AdminAPIKey: "x"})
+	_, err := m.fetchSnapshotFromContainer(context.Background(), c, "sess-truncated")
+	if err == nil {
+		t.Fatalf("expected error on missing snapshot trailer, got nil")
+	}
+	if !strings.Contains(err.Error(), "snapshot stream incomplete") {
+		t.Fatalf("expected stream-incomplete error, got: %v", err)
+	}
+}
+
+func TestGetOrAssignDiscardsUnhealthyWarmContainer(t *testing.T) {
+	// First warm container 503s on /health; orchestrator must drop it,
+	// pop the next one, and assign that.
+	bk := newFakeBuckets()
+	defer bk.Close()
+	bad := newFakeContainer(nil)
+	bad.mu.Lock()
+	bad.healthStatus = http.StatusServiceUnavailable
+	bad.mu.Unlock()
+	defer bad.Close()
+	good := newFakeContainer(nil)
+	defer good.Close()
+
+	cBad := fakeContainer(bad)
+	cBad.Name = "bad"
+	cGood := fakeContainer(good)
+	cGood.Name = "good"
+
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, PoolSize: 2, MaxContainers: 4, IdleTimeout: time.Hour})
+	m.warmPool = []*Container{cBad, cGood}
+
+	got, errMsg := m.GetOrAssign(context.Background(), "sess-health", nil)
+	if got == nil {
+		t.Fatalf("GetOrAssign failed: %s", errMsg)
+	}
+	if got != cGood {
+		t.Fatalf("expected to assign healthy container %q, got %q", cGood.Name, got.Name)
+	}
+	m.mu.Lock()
+	left := len(m.warmPool)
+	m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("expected warm pool drained (1 discarded + 1 assigned), got %d left", left)
+	}
+}
+
 func TestPerSessionSerialization(t *testing.T) {
 	// No exec key → restore is skipped, GetOrAssign just pulls from
 	// warm pool. Two goroutines racing for the same session should both
 	// see the same container.
 	bk := newFakeBuckets()
 	defer bk.Close()
-	prev := bucketsBase
-	bucketsBase = bk.URL
-	defer func() { bucketsBase = prev }()
-
 	fc := newFakeContainer(nil)
 	defer fc.Close()
 	c1 := fakeContainer(fc)
@@ -379,7 +454,7 @@ func TestPerSessionSerialization(t *testing.T) {
 	c2 := fakeContainer(fc)
 	c2.Name = "second"
 
-	m := NewManager(ManagerConfig{AdminAPIKey: "x", PoolSize: 2, MaxContainers: 8, IdleTimeout: time.Hour})
+	m := NewManager(ManagerConfig{AdminAPIKey: "x", BucketsBase: bk.URL, PoolSize: 2, MaxContainers: 8, IdleTimeout: time.Hour})
 	m.warmPool = []*Container{c1, c2}
 
 	var wg sync.WaitGroup
