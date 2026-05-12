@@ -61,32 +61,22 @@ func (m *Manager) proxy(ctx context.Context, c *Container, path string, body []b
 	return resp.StatusCode, data, nil
 }
 
-// recordContainerStatus tracks back-to-back 403s from the executor's
-// auth-token gate. Two in a row means the container has a different
-// auth token claimed than what we're sending — almost certainly a
-// poisoned warm-pool container or session-map drift, so we destroy the
-// session. Non-403 4xx/5xx are ignored: not evidence of token mismatch.
+// recordContainerStatus reacts to the executor's auth-token gate.
+// A 403 deterministically means our auth token doesn't match what the
+// container's gate locked to — no retry can fix it without changing
+// the token, and the token is HKDF-derived from session identity, so
+// we destroy the session immediately on first 403.
 func (m *Manager) recordContainerStatus(c *Container, status int) {
-	if status >= 200 && status < 300 {
-		c.mu.Lock()
-		c.Consecutive403s = 0
-		c.mu.Unlock()
-		return
-	}
 	if status != http.StatusForbidden {
 		return
 	}
 	c.mu.Lock()
-	c.Consecutive403s++
-	n := c.Consecutive403s
 	accessToken := c.AccessToken
 	c.mu.Unlock()
-	if n >= 2 {
-		log.Printf("orchestrator: container %s rejected the session's auth token twice — destroying", c.Name)
-		// accessToken is "" until the container is committed in GetOrAssign;
-		// during restore CleanupSession("") is a safe no-op.
-		m.CleanupSession(accessToken)
-	}
+	log.Printf("orchestrator: container %s rejected the session's auth token — destroying", c.Name)
+	// accessToken is "" until the container is committed in GetOrAssign;
+	// during restore CleanupSession("") is a safe no-op.
+	m.CleanupSession(accessToken)
 }
 
 // ExecCommand runs a bash command in the session's container.

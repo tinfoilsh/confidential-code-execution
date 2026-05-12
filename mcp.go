@@ -7,8 +7,7 @@ import (
 	"regexp"
 )
 
-var validAccessTokenRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
-var validContainerAuthTokenRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var hex64Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type jsonRPCRequest struct {
 	JSONRPC string         `json:"jsonrpc"`
@@ -61,7 +60,7 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token header is required"}
 			return http.StatusBadRequest, resp
 		}
-		if !validAccessTokenRe.MatchString(accessToken) {
+		if !hex64Re.MatchString(accessToken) {
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token has invalid format"}
 			return http.StatusBadRequest, resp
 		}
@@ -70,7 +69,7 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Container-Auth-Token header is required"}
 			return http.StatusBadRequest, resp
 		}
-		if !validContainerAuthTokenRe.MatchString(containerAuthToken) {
+		if !hex64Re.MatchString(containerAuthToken) {
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Container-Auth-Token has invalid format"}
 			return http.StatusBadRequest, resp
 		}

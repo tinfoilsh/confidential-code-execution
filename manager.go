@@ -30,7 +30,6 @@ type Container struct {
 	Bearer                     string // api_key from the request's Authorization header
 	CodeExecutionEncryptionKey string // X-Code-Execution-Encryption-Key from request
 	AccessToken                string // X-Code-Execution-Access-Token; same as Manager.sessions map key
-	Consecutive403s            int
 	HealthFailures             int
 }
 
