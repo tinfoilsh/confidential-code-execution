@@ -54,19 +54,19 @@ func (m *Manager) proxy(ctx context.Context, c *Container, path string, body []b
 	data, readErr := readLimited(resp.Body, maxExecutorBody)
 	// Bump activity even on non-2xx — the user is still interacting.
 	c.bumpActivity()
-	m.recordContainerStatus(c, resp.StatusCode)
+	m.handleAuthGate(c, resp.StatusCode)
 	if readErr != nil {
 		return resp.StatusCode, nil, readErr
 	}
 	return resp.StatusCode, data, nil
 }
 
-// recordContainerStatus reacts to the executor's auth-token gate.
+// handleAuthGate reacts to the executor's auth-token gate.
 // A 403 deterministically means our auth token doesn't match what the
 // container's gate locked to — no retry can fix it without changing
 // the token, and the token is HKDF-derived from session identity, so
 // we destroy the session immediately on first 403.
-func (m *Manager) recordContainerStatus(c *Container, status int) {
+func (m *Manager) handleAuthGate(c *Container, status int) {
 	if status != http.StatusForbidden {
 		return
 	}

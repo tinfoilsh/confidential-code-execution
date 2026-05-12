@@ -189,8 +189,7 @@ func (b *Buckets) putOnce(ctx context.Context, bearer, accessToken string, body 
 // ---------------------------------------------------------------------------
 
 // pushRestore POSTs the plaintext tar to the container's /restore.
-// Retries transient (5xx, network) failures internally. recordContainerStatus
-// is called on every attempt so 403s still count toward the threshold.
+// Retries transient (5xx, network) failures internally.
 func (m *Manager) pushRestore(ctx context.Context, c *Container, plaintextTar []byte) error {
 	if c.httpClient == nil {
 		return fmt.Errorf("no http client for container %s", c.Name)
@@ -224,7 +223,7 @@ func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, body []byte
 	}
 	defer resp.Body.Close()
 	_, _ = readLimited(resp.Body, maxExecutorBody)
-	m.recordContainerStatus(c, resp.StatusCode)
+	m.handleAuthGate(c, resp.StatusCode)
 	if resp.StatusCode >= 500 {
 		return struct{}{}, true, fmt.Errorf("restore returned %d", resp.StatusCode)
 	}
@@ -253,7 +252,7 @@ func (m *Manager) fetchSnapshotFromContainer(ctx context.Context, c *Container) 
 	}
 	defer resp.Body.Close()
 	data, readErr := readLimited(resp.Body, maxSnapshotBody)
-	m.recordContainerStatus(c, resp.StatusCode)
+	m.handleAuthGate(c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("snapshot returned %d", resp.StatusCode)
 	}
