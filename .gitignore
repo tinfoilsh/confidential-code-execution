@@ -8,3 +8,6 @@ logs/
 # Go binaries
 /confidential-code-execution
 /orchestrator
+/cce-dev
+
+.claude/
