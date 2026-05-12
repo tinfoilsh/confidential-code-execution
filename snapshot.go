@@ -208,12 +208,16 @@ func (m *Manager) pushRestore(ctx context.Context, c *Container, accessToken str
 }
 
 func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, accessToken string, body []byte) (struct{}, bool, error) {
+	authToken := sessionContainerAuthToken(ctx)
+	if authToken == "" {
+		return struct{}{}, false, fmt.Errorf("missing container auth token on ctx for restore")
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+c.Domain+"/restore", bytes.NewReader(body))
 	if err != nil {
 		return struct{}{}, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
+	req.Header.Set("X-Code-Execution-Container-Auth-Token", authToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return struct{}{}, true, fmt.Errorf("restore POST: %w", err)
@@ -233,6 +237,7 @@ func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, accessToken
 // Streams a plaintext tar of /workspace.
 // Clean stream is signaled by the X-Snapshot-Status: ok HTTP trailer;
 // 200 with the trailer absent or != "ok" means there was a problem.
+// /snapshot doesn't need an auth-token
 func (m *Manager) fetchSnapshotFromContainer(ctx context.Context, c *Container, accessToken string) ([]byte, error) {
 	if c.httpClient == nil {
 		return nil, fmt.Errorf("no http client for container %s", c.Name)
@@ -242,7 +247,6 @@ func (m *Manager) fetchSnapshotFromContainer(ctx context.Context, c *Container, 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot POST: %w", err)

@@ -32,6 +32,10 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 	if c.httpClient == nil {
 		return 0, nil, fmt.Errorf("no http client for container %s", c.Name)
 	}
+	authToken := sessionContainerAuthToken(ctx)
+	if authToken == "" {
+		return 0, nil, fmt.Errorf("missing container auth token on ctx for %s %s", c.Name, path)
+	}
 	callCtx, cancel := context.WithTimeout(ctx, toolCallTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(callCtx, "POST", "https://"+c.Domain+path, bytes.NewReader(body))
@@ -39,7 +43,7 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
+	req.Header.Set("X-Code-Execution-Container-Auth-Token", authToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		log.Printf("orchestrator: proxy %s %s: %v", c.Name, path, err)
@@ -58,8 +62,8 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 }
 
 // recordContainerStatus tracks back-to-back 403s from the executor's
-// access-token gate. Two in a row means the container has a different
-// access token claimed than what we're sending — almost certainly a
+// auth-token gate. Two in a row means the container has a different
+// auth token claimed than what we're sending — almost certainly a
 // poisoned warm-pool container or session-map drift, so we destroy the
 // session. Non-403 4xx/5xx are ignored: not evidence of token mismatch.
 func (m *Manager) recordContainerStatus(accessToken string, c *Container, status int) {

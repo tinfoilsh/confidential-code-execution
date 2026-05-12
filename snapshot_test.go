@@ -244,6 +244,7 @@ func TestRestoreOnAssign(t *testing.T) {
 	// Webapp sends url-safe base64; orchestrator should normalize.
 	ctx := WithCodeExecutionEncryptionKey(context.Background(), keyURL)
 	ctx = WithBearer(ctx, "tk_test")
+	ctx = WithContainerAuthToken(ctx, "auth-tok-1")
 
 	got, errMsg := m.GetOrAssign(ctx, "sess-1", nil)
 	if got == nil {
