@@ -28,9 +28,13 @@ func (m *Manager) buildProxyClient(c *Container) (*http.Client, error) {
 	return httpClient, nil
 }
 
-func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path string, body []byte) (int, []byte, error) {
+func (m *Manager) proxy(ctx context.Context, c *Container, path string, body []byte) (int, []byte, error) {
 	if c.httpClient == nil {
 		return 0, nil, fmt.Errorf("no http client for container %s", c.Name)
+	}
+	authToken := sessionContainerAuthToken(ctx)
+	if authToken == "" {
+		return 0, nil, fmt.Errorf("missing container auth token on ctx for %s %s", c.Name, path)
 	}
 	callCtx, cancel := context.WithTimeout(ctx, toolCallTimeout)
 	defer cancel()
@@ -39,7 +43,7 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
+	req.Header.Set("X-Code-Execution-Container-Auth-Token", authToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		log.Printf("orchestrator: proxy %s %s: %v", c.Name, path, err)
@@ -50,36 +54,29 @@ func (m *Manager) proxy(ctx context.Context, c *Container, accessToken, path str
 	data, readErr := readLimited(resp.Body, maxExecutorBody)
 	// Bump activity even on non-2xx — the user is still interacting.
 	c.bumpActivity()
-	m.recordContainerStatus(accessToken, c, resp.StatusCode)
+	m.handleAuthGate(c, resp.StatusCode)
 	if readErr != nil {
 		return resp.StatusCode, nil, readErr
 	}
 	return resp.StatusCode, data, nil
 }
 
-// recordContainerStatus tracks back-to-back 403s from the executor's
-// access-token gate. Two in a row means the container has a different
-// access token claimed than what we're sending — almost certainly a
-// poisoned warm-pool container or session-map drift, so we destroy the
-// session. Non-403 4xx/5xx are ignored: not evidence of token mismatch.
-func (m *Manager) recordContainerStatus(accessToken string, c *Container, status int) {
-	if status >= 200 && status < 300 {
-		c.mu.Lock()
-		c.Consecutive403s = 0
-		c.mu.Unlock()
-		return
-	}
+// handleAuthGate reacts to the executor's auth-token gate.
+// A 403 deterministically means our auth token doesn't match what the
+// container's gate locked to — no retry can fix it without changing
+// the token, and the token is HKDF-derived from session identity, so
+// we destroy the session immediately on first 403.
+func (m *Manager) handleAuthGate(c *Container, status int) {
 	if status != http.StatusForbidden {
 		return
 	}
 	c.mu.Lock()
-	c.Consecutive403s++
-	n := c.Consecutive403s
+	accessToken := c.AccessToken
 	c.mu.Unlock()
-	if n >= 2 {
-		log.Printf("orchestrator: container %s rejected the session's access token twice — destroying", c.Name)
-		m.CleanupSession(accessToken)
-	}
+	log.Printf("orchestrator: container %s rejected the session's auth token — destroying", c.Name)
+	// accessToken is "" until the container is committed in GetOrAssign;
+	// during restore CleanupSession("") is a safe no-op.
+	m.CleanupSession(accessToken)
 }
 
 // ExecCommand runs a bash command in the session's container.
@@ -89,7 +86,7 @@ func (m *Manager) ExecCommand(ctx context.Context, accessToken, command string) 
 		return map[string]any{"error": errMsg}
 	}
 	body, _ := json.Marshal(map[string]string{"command": command})
-	status, raw, _ := m.proxy(ctx, c, accessToken, "/exec", body)
+	status, raw, _ := m.proxy(ctx, c, "/exec", body)
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status)}
@@ -104,7 +101,7 @@ func (m *Manager) ReadFile(ctx context.Context, accessToken, path string) (strin
 		return "", fmt.Errorf("%s", errMsg)
 	}
 	body, _ := json.Marshal(map[string]string{"path": path})
-	_, raw, _ := m.proxy(ctx, c, accessToken, "/read", body)
+	_, raw, _ := m.proxy(ctx, c, "/read", body)
 	var resp struct {
 		Contents string `json:"contents"`
 		Error    string `json:"error"`
@@ -130,7 +127,7 @@ func (m *Manager) WriteFile(ctx context.Context, accessToken, path, content stri
 	}
 	encoded := base64.StdEncoding.EncodeToString([]byte(content))
 	body, _ := json.Marshal(map[string]string{"path": path, "contents": encoded})
-	status, raw, _ := m.proxy(ctx, c, accessToken, "/write", body)
+	status, raw, _ := m.proxy(ctx, c, "/write", body)
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return map[string]any{"error": fmt.Sprintf("proxy returned status %d", status)}

@@ -7,8 +7,7 @@ import (
 	"regexp"
 )
 
-// Format-validated so it can't path-traverse on buckets
-var validAccessTokenRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var hex64Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 type jsonRPCRequest struct {
 	JSONRPC string         `json:"jsonrpc"`
@@ -61,8 +60,17 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token header is required"}
 			return http.StatusBadRequest, resp
 		}
-		if !validAccessTokenRe.MatchString(accessToken) {
+		if !hex64Re.MatchString(accessToken) {
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token has invalid format"}
+			return http.StatusBadRequest, resp
+		}
+		containerAuthToken := headers.Get("X-Code-Execution-Container-Auth-Token")
+		if containerAuthToken == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Container-Auth-Token header is required"}
+			return http.StatusBadRequest, resp
+		}
+		if !hex64Re.MatchString(containerAuthToken) {
+			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Container-Auth-Token has invalid format"}
 			return http.StatusBadRequest, resp
 		}
 		bearer := extractBearer(headers.Get("Authorization"))
@@ -74,9 +82,11 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32603, Message: "auth check failed: " + err.Error()}
 			return http.StatusInternalServerError, resp
 		}
-		// Stash the keys on the ctx. They are used by the manager
+		// Stash on ctx. Encryption key + bearer are cached on the container by the manager.
+		// AuthToken only exists per request
 		ctx = WithCodeExecutionEncryptionKey(ctx, headers.Get("X-Code-Execution-Encryption-Key"))
 		ctx = WithBearer(ctx, bearer)
+		ctx = WithContainerAuthToken(ctx, containerAuthToken)
 		name, _ := req.Params["name"].(string)
 		args, _ := req.Params["arguments"].(map[string]any)
 		handler, ok := ToolHandlers[name]

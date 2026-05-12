@@ -189,9 +189,8 @@ func (b *Buckets) putOnce(ctx context.Context, bearer, accessToken string, body 
 // ---------------------------------------------------------------------------
 
 // pushRestore POSTs the plaintext tar to the container's /restore.
-// Retries transient (5xx, network) failures internally. recordContainerStatus
-// is called on every attempt so 403s still count toward the threshold.
-func (m *Manager) pushRestore(ctx context.Context, c *Container, accessToken string, plaintextTar []byte) error {
+// Retries transient (5xx, network) failures internally.
+func (m *Manager) pushRestore(ctx context.Context, c *Container, plaintextTar []byte) error {
 	if c.httpClient == nil {
 		return fmt.Errorf("no http client for container %s", c.Name)
 	}
@@ -202,25 +201,29 @@ func (m *Manager) pushRestore(ctx context.Context, c *Container, accessToken str
 		return err
 	}
 	_, err = httpRetry(ctx, pushRestoreAttempts, restorePushRetryDelay, func() (struct{}, bool, error) {
-		return m.pushRestoreOnce(ctx, c, accessToken, body)
+		return m.pushRestoreOnce(ctx, c, body)
 	})
 	return err
 }
 
-func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, accessToken string, body []byte) (struct{}, bool, error) {
+func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, body []byte) (struct{}, bool, error) {
+	authToken := sessionContainerAuthToken(ctx)
+	if authToken == "" {
+		return struct{}{}, false, fmt.Errorf("missing container auth token on ctx for restore")
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://"+c.Domain+"/restore", bytes.NewReader(body))
 	if err != nil {
 		return struct{}{}, false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
+	req.Header.Set("X-Code-Execution-Container-Auth-Token", authToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return struct{}{}, true, fmt.Errorf("restore POST: %w", err)
 	}
 	defer resp.Body.Close()
 	_, _ = readLimited(resp.Body, maxExecutorBody)
-	m.recordContainerStatus(accessToken, c, resp.StatusCode)
+	m.handleAuthGate(c, resp.StatusCode)
 	if resp.StatusCode >= 500 {
 		return struct{}{}, true, fmt.Errorf("restore returned %d", resp.StatusCode)
 	}
@@ -233,7 +236,8 @@ func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, accessToken
 // Streams a plaintext tar of /workspace.
 // Clean stream is signaled by the X-Snapshot-Status: ok HTTP trailer;
 // 200 with the trailer absent or != "ok" means there was a problem.
-func (m *Manager) fetchSnapshotFromContainer(ctx context.Context, c *Container, accessToken string) ([]byte, error) {
+// /snapshot doesn't need an auth-token
+func (m *Manager) fetchSnapshotFromContainer(ctx context.Context, c *Container) ([]byte, error) {
 	if c.httpClient == nil {
 		return nil, fmt.Errorf("no http client for container %s", c.Name)
 	}
@@ -242,14 +246,13 @@ func (m *Manager) fetchSnapshotFromContainer(ctx context.Context, c *Container, 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Code-Execution-Access-Token", accessToken)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot POST: %w", err)
 	}
 	defer resp.Body.Close()
 	data, readErr := readLimited(resp.Body, maxSnapshotBody)
-	m.recordContainerStatus(accessToken, c, resp.StatusCode)
+	m.handleAuthGate(c, resp.StatusCode)
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("snapshot returned %d", resp.StatusCode)
 	}

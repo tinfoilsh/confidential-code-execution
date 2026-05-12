@@ -29,7 +29,7 @@ type Container struct {
 	LastActivity               time.Time
 	Bearer                     string // api_key from the request's Authorization header
 	CodeExecutionEncryptionKey string // X-Code-Execution-Encryption-Key from request
-	Consecutive403s            int
+	AccessToken                string // X-Code-Execution-Access-Token; same as Manager.sessions map key
 	HealthFailures             int
 }
 
@@ -378,7 +378,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		if tarBytes == nil {
 			restores.WithLabelValues("empty").Inc()
 		} else {
-			if err := m.pushRestore(ctx, c, accessToken, tarBytes); err != nil {
+			if err := m.pushRestore(ctx, c, tarBytes); err != nil {
 				restores.WithLabelValues("failure").Inc()
 				c.setStatus("failed")
 				go m.cp.deleteContainer(c.ID)
@@ -397,6 +397,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	c.LastActivity = now
 	c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
 	c.Bearer = bearer
+	c.AccessToken = accessToken
 	c.mu.Unlock()
 	m.mu.Lock()
 	m.sessions[accessToken] = c
@@ -444,7 +445,7 @@ func (m *Manager) evictAndSnapshot(ctx context.Context, accessToken string, c *C
 			m.cp.deleteContainer(c.ID)
 			return
 		}
-		tarBytes, err := m.fetchSnapshotFromContainer(ctx, c, accessToken)
+		tarBytes, err := m.fetchSnapshotFromContainer(ctx, c)
 		if err != nil {
 			snapshots.WithLabelValues("failure").Inc()
 		} else if err := m.buckets.put(ctx, bearer, accessToken, key, tarBytes); err != nil {

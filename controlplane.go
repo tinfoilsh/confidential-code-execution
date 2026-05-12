@@ -220,6 +220,7 @@ type ctxKey int
 const (
 	ctxKeyCodeExecutionEncryptionKey ctxKey = iota
 	ctxKeyBearer
+	ctxKeyContainerAuthToken
 )
 
 func WithCodeExecutionEncryptionKey(ctx context.Context, key string) context.Context {
@@ -243,5 +244,18 @@ func WithBearer(ctx context.Context, bearer string) context.Context {
 
 func sessionBearer(ctx context.Context) string {
 	v, _ := ctx.Value(ctxKeyBearer).(string)
+	return v
+}
+
+// Per-request only
+func WithContainerAuthToken(ctx context.Context, token string) context.Context {
+	if token != "" {
+		ctx = context.WithValue(ctx, ctxKeyContainerAuthToken, token)
+	}
+	return ctx
+}
+
+func sessionContainerAuthToken(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyContainerAuthToken).(string)
 	return v
 }
