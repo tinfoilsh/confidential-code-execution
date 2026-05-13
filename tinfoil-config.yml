@@ -8,6 +8,9 @@ memory: 16384
 containers:
   - name: "orchestrator"
     image: "ghcr.io/tinfoilsh/confidential-code-execution@sha256:70bb657901fbd0093c48a83a1b75eba778069f6e341a149f985da02685c77a2f" # v0.0.1
+    env:
+      - POOL_SIZE: "4"
+      - IDLE_TIMEOUT: "180"
     secrets:
       - SCOPED_CODE_EXEC_ADMIN_KEY
 
