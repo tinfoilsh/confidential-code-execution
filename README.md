@@ -82,7 +82,7 @@ go build .
 | `MAX_CONTAINERS`           | `10`                                   | Hard cap on concurrent containers (warm + inflight + sessions).                                           |
 | `POLL_INTERVAL`            | `2`                                    | Seconds between pool-manager ticks. Backs off up to 30s on consecutive controlplane failures.             |
 | `ENVIRONMENT_REPO`         | `tinfoilsh/code-execution-environment` | Source repo for the executor image.                                                                       |
-| `ENVIRONMENT_TAG`          | `v0.0.9`                               | Image tag to deploy.                                                                                      |
+| `ENVIRONMENT_TAG`          | `v0.0.11`                              | Image tag to deploy.                                                                                      |
 | `IDLE_TIMEOUT`             | `60`                                   | Seconds of session inactivity before snapshot+evict.                                                      |
 | `EVICTION_POLL`            | `30`                                   | Seconds between idle-evictor scans.                                                                       |
 | `WARM_POOL_WAIT_TIMEOUT`   | `10`                                   | Seconds a `tools/call` will wait for a warm container before returning an at-capacity error.              |
@@ -93,7 +93,12 @@ go build .
 
 Build tags:
 
-- `-tags dev` — disables enclave attestation + TLS pinning (`proxy_dev.go`) and api_key validation (`auth_dev.go`). Local dev only; never ship a binary built with this tag.
+- `-tags dev` — disables enclave attestation + TLS pinning (`proxy_dev.go`) and api_key validation (`auth_dev.go`).
+
+Specifically:
+
+1. `auth_dev.go` skips validating that the bearer is valid to even hit this MCP. It does not prevent buckets from failing though, since buckets also takes this bearer.
+2. `proxy_dev.go` skips attestation & TLS pinning for the environment container
 
 ### API
 
@@ -111,6 +116,40 @@ Methods:
 
 Tools: bash, view, present, str_replace, create, insert
 ```
+
+#### curl
+
+`initialize` and `tools/list` need no headers:
+
+```bash
+curl -s -X POST localhost:7070/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+curl -s -X POST localhost:7070/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+`tools/call` requires two 64-hex session tokens and a user api_key as the
+`Authorization` bearer (validated against the controlplane; in `-tags dev`
+builds the validation is skipped but the bearer is still used for buckets
+auth on snapshot/restore):
+
+```bash
+# Generat an access token w/ openssl rand -hex 32
+# Can use a random auth token for testing
+
+curl -s -X POST localhost:7070/mcp \
+  -H 'Content-Type: application/json' \
+  -H "X-Code-Execution-Access-Token: $ACCESS_TOKEN" \
+  -H "X-Code-Execution-Container-Auth-Token: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+  -H "Authorization: Bearer $TINFOIL_API_KEY" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bash","arguments":{"command":"echo hello from sandbox; uname -a"}}}'
+```
+
+Reuse the same `X-Code-Execution-Access-Token` across calls to hit the
+same session (state persists in `/workspace`).
 
 Other endpoints:
 
