@@ -104,24 +104,24 @@ Specifically:
 
 ### API
 
-All tool access is through the single MCP endpoint. The session is identified by the per-chat secret in the `X-Code-Execution-Access-Token` header.
+All tool access is through the single MCP endpoint. Per-request secrets ride inside `params._meta.tinfoil_code_exec` on each `tools/call` — never on HTTP headers — so middleware (access logs, tracing) cannot observe them. The session is identified by the `accessToken` field in that block.
 
 ```
 POST /mcp
-Headers: X-Code-Execution-Access-Token: <token>
+Headers: Authorization: Bearer <api_key>
 Body: JSON-RPC 2.0
 
 Methods:
   initialize       — handshake
   tools/list       — list available tools
-  tools/call       — invoke a tool (params: {name, arguments})
+  tools/call       — invoke a tool (params: {_meta, name, arguments})
 
 Tools: bash, view, present, str_replace, create, insert
 ```
 
 #### curl
 
-`initialize` and `tools/list` need no headers:
+`initialize` and `tools/list` need no auth:
 
 ```bash
 curl -s -X POST localhost:7070/mcp \
@@ -133,30 +133,45 @@ curl -s -X POST localhost:7070/mcp \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 ```
 
-`tools/call` requires three session headers and a user api_key as the
-`Authorization` bearer (validated against the controlplane; in `-tags dev`
-builds the validation is skipped but the bearer is still used for buckets
-auth on snapshot/restore):
+`tools/call` requires three credentials nested under `params._meta.tinfoil_code_exec` and a user api_key as the `Authorization` bearer (validated against the controlplane; in `-tags dev` builds the validation is skipped but the bearer is still used for buckets auth on snapshot/restore):
 
-| Header                                  | Format                                           | Notes                                                                                                  |
-| --------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
-| `X-Code-Execution-Access-Token`         | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Session identifier. Reuse across calls to hit the same session (state persists in `/workspace`).       |
-| `X-Code-Execution-Container-Auth-Token` | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Per-request auth to the underlying executor. Any 64-hex value works for testing.                       |
-| `X-Code-Execution-Encryption-Key`       | 43 base64url chars (32 bytes, unpadded)          | Wraps the session snapshot key. Frozen at first assignment — changing it after that returns an error.  |
-| `Authorization`                         | `Bearer <api_key>`                               | Validated by the controlplane (skipped in `-tags dev`); reused as the buckets bearer for snapshot I/O. |
+| `params._meta.tinfoil_code_exec` field | Format                                           | Notes                                                                                                 |
+| -------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| `accessToken`                          | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Session identifier. Reuse across calls to hit the same session (state persists in `/workspace`).      |
+| `containerAuthToken`                   | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Per-request auth to the underlying executor. Any 64-hex value works for testing.                      |
+| `encryptionKey`                        | 43 base64url chars (32 bytes, unpadded)          | Wraps the session snapshot key. Frozen at first assignment — changing it after that returns an error. |
+
+| Header          | Format             | Notes                                                                                                  |
+| --------------- | ------------------ | ------------------------------------------------------------------------------------------------------ |
+| `Authorization` | `Bearer <api_key>` | Validated by the controlplane (skipped in `-tags dev`); reused as the buckets bearer for snapshot I/O. |
 
 ```bash
-# Generat an access token w/ openssl rand -hex 32
-# Generate an encryption key w/ openssl rand 32 | base64 | tr '+/' '-_' | tr -d '='
-# Can use a random auth token for testing
+# Generate an access token: openssl rand -hex 32
+# Generate an encryption key:  openssl rand 32 | base64 | tr '+/' '-_' | tr -d '='
+# Any 64-hex value works as containerAuthToken for testing.
 
 curl -s -X POST https://confidential-code-execution.debug.tinfoil.containers.tinfoil.dev/mcp \
   -H 'Content-Type: application/json' \
-  -H "X-Code-Execution-Access-Token: $ACCESS_TOKEN" \
-  -H "X-Code-Execution-Container-Auth-Token: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
-  -H "X-Code-Execution-Encryption-Key: $ENCRYPTION_KEY" \
   -H "Authorization: Bearer $TINFOIL_API_KEY" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bash","arguments":{"command":"echo hello from sandbox; uname -a"}}}'
+  -d "$(cat <<EOF
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "_meta": {
+      "tinfoil_code_exec": {
+        "accessToken": "$ACCESS_TOKEN",
+        "containerAuthToken": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "encryptionKey": "$ENCRYPTION_KEY"
+      }
+    },
+    "name": "bash",
+    "arguments": {"command": "echo hello from sandbox; uname -a"}
+  }
+}
+EOF
+)"
 ```
 
 Other endpoints:

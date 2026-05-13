@@ -29,8 +29,8 @@ type Container struct {
 	AssignedAt                 time.Time
 	LastActivity               time.Time
 	Bearer                     string // api_key from the request's Authorization header
-	CodeExecutionEncryptionKey string // X-Code-Execution-Encryption-Key from request
-	AccessToken                string // X-Code-Execution-Access-Token; same as Manager.sessions map key
+	CodeExecutionEncryptionKey string // params._meta.tinfoil_code_exec.encryptionKey
+	AccessToken                string // params._meta.tinfoil_code_exec.accessToken; same as Manager.sessions map key
 	HealthFailures             int
 }
 
