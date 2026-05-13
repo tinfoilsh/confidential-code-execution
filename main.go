@@ -68,13 +68,13 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 }
 
 func main() {
-	adminAPIKey := os.Getenv("ADMIN_API_KEY")
-	if adminAPIKey == "" {
-		log.Fatal("ADMIN_API_KEY is required")
+	scopedCodeExecAdminKey := os.Getenv("SCOPED_CODE_EXEC_ADMIN_KEY")
+	if scopedCodeExecAdminKey == "" {
+		log.Fatal("SCOPED_CODE_EXEC_ADMIN_KEY is required")
 	}
 
 	cfg := ManagerConfig{
-		AdminAPIKey:            adminAPIKey,
+		ScopedCodeExecAdminKey: scopedCodeExecAdminKey,
 		ControlPlaneURL:        envStr("CONTROL_PLANE_URL", "https://api.tinfoil.sh"),
 		BucketsBase:            envStr("BUCKETS_BASE", "https://buckets.tinfoil.sh"),
 		PoolSize:               envInt("POOL_SIZE", 3),
@@ -89,7 +89,7 @@ func main() {
 		ShutdownDeadline:       time.Duration(envInt("SHUTDOWN_DEADLINE", 25)) * time.Second,
 		// Execution Environment
 		EnvironmentRepo: envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
-		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.11"),
+		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.12"),
 	}
 
 	port := envInt("PORT", 7070)
@@ -121,20 +121,25 @@ func main() {
 		writeJSON(w, status, resp)
 	})
 
-	// On SIGINT/SIGTERM, run Finish() to delete all containers, then shut down.
+	// On SIGINT/SIGTERM, stop accepting new requests, then run Finish()
+	// to snapshot active sessions and bulk-delete containers.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-sigCh
 		log.Println("orchestrator: caught signal, finalizing...")
-		mgr.Finish()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		srv.Shutdown(ctx)
+		mgr.Finish()
 	}()
 
 	log.Printf("orchestrator listening on :%d", port)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	// Wait here so the process doesn't exit mid-cleanup
+	<-shutdownDone
 }

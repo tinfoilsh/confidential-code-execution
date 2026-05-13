@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"log"
@@ -46,7 +47,7 @@ func (c *Container) bumpActivity() {
 }
 
 type ManagerConfig struct {
-	AdminAPIKey     string
+	ScopedCodeExecAdminKey string
 	ControlPlaneURL string // CONTROL_PLANE_URL
 	BucketsBase     string // BUCKETS_BASE
 	PoolSize        int
@@ -80,6 +81,10 @@ type Manager struct {
 	finishOnce  sync.Once
 	done        chan struct{} // closed by Finish to signal shutdown
 
+	// Cancelled by Finish so any in-flight evictSessionAsync goroutine aborts
+	lifetime       context.Context
+	cancelLifetime context.CancelFunc
+
 	// Bearers that recently passed validate-key
 	authCacheMu sync.Mutex
 	authCache   map[string]time.Time
@@ -94,7 +99,7 @@ type Manager struct {
 func NewManager(cfg ManagerConfig) *Manager {
 	m := &Manager{
 		cfg:         cfg,
-		cp:          NewControlplane(cfg.ControlPlaneURL, cfg.AdminAPIKey),
+		cp:          NewControlplane(cfg.ControlPlaneURL, cfg.ScopedCodeExecAdminKey),
 		buckets:     NewBuckets(cfg.BucketsBase),
 		sessions:    map[string]*Container{},
 		assignLocks: map[string]*sync.Mutex{},
@@ -102,6 +107,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		authCache:   map[string]time.Time{},
 		snapshotSem: make(chan struct{}, cfg.MaxConcurrentSnapshots),
 	}
+	m.lifetime, m.cancelLifetime = context.WithCancel(context.Background())
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -132,16 +138,28 @@ func (m *Manager) replenishPool() []*Container {
 
 	var created []*Container
 	for range needed {
+		// Skip the next createContainer if shutdown's already started.
+		select {
+		case <-m.done:
+			return created
+		default:
+		}
 		c, err := m.cp.createContainer(m.cfg.EnvironmentRepo, m.cfg.EnvironmentTag)
 		if err != nil {
 			break
 		}
-		created = append(created, c)
-	}
-	if len(created) > 0 {
+		// Register immediately
 		m.mu.Lock()
-		m.inflight = append(m.inflight, created...)
+		select {
+		case <-m.done:
+			m.mu.Unlock()
+			go m.cp.deleteContainer(c.ID)
+			return created
+		default:
+		}
+		m.inflight = append(m.inflight, c)
 		m.mu.Unlock()
+		created = append(created, c)
 	}
 	return created
 }
@@ -260,14 +278,22 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	codeExecutionEncryptionKey := sessionCodeExecutionEncryptionKey(ctx)
 	bearer := sessionBearer(ctx)
 
-	// Fast path: existing session — no per-session lock needed since
-	// we're just refreshing keys on a container that's already in the map.
+	// Fast path: existing session.
+	// Slow path: The encryption key is frozen at first assignment to prevent an attacker
+	// with the accessToken from changing this.
+	// The bearer is allowed to rotate
 	m.mu.Lock()
 	if c, ok := m.sessions[accessToken]; ok {
 		m.mu.Unlock()
 		c.mu.Lock()
-		if codeExecutionEncryptionKey != "" {
-			c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
+		if codeExecutionEncryptionKey != "" &&
+			c.CodeExecutionEncryptionKey != "" &&
+			subtle.ConstantTimeCompare(
+				[]byte(c.CodeExecutionEncryptionKey),
+				[]byte(codeExecutionEncryptionKey),
+			) != 1 {
+			c.mu.Unlock()
+			return nil, "encryption key mismatch for existing session"
 		}
 		if bearer != "" {
 			c.Bearer = bearer
@@ -276,7 +302,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		return c, ""
 	}
 	// Capacity check before lockSession so a flood of unique tokens
-	// can't grow assignLocks past MaxContainers.
+	// fails fast without churning warm-pool state.
 	if len(m.sessions) >= m.cfg.MaxContainers {
 		m.mu.Unlock()
 		return nil, fmt.Sprintf("at capacity (%d sessions)", m.cfg.MaxContainers)
@@ -287,25 +313,11 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	sl.Lock()
 	defer sl.Unlock()
 
-	// If we never end up registering a session, drop the assignLocks so it doesn't grow the map
-	assigned := false
-	defer func() {
-		if assigned {
-			return
-		}
-		m.mu.Lock()
-		if _, ok := m.sessions[accessToken]; !ok {
-			delete(m.assignLocks, accessToken)
-		}
-		m.mu.Unlock()
-	}()
-
 	// Re-check after acquiring sl: another goroutine may have assigned
 	// while we were waiting.
 	m.mu.Lock()
 	if c, ok := m.sessions[accessToken]; ok {
 		m.mu.Unlock()
-		assigned = true
 		return c, ""
 	}
 	m.mu.Unlock()
@@ -378,10 +390,20 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		if tarBytes == nil {
 			restores.WithLabelValues("empty").Inc()
 		} else {
-			if err := m.pushRestore(ctx, c, tarBytes); err != nil {
+			transient, err := m.pushRestore(ctx, c, tarBytes)
+			if err != nil {
 				restores.WithLabelValues("failure").Inc()
-				c.setStatus("failed")
-				go m.cp.deleteContainer(c.ID)
+				if transient {
+					// Exhausted retries on a network / 5xx flake.
+					m.mu.Lock()
+					m.warmPool = append(m.warmPool, c)
+					m.cond.Broadcast()
+					m.mu.Unlock()
+				} else {
+					// Hard failure from container
+					c.setStatus("failed")
+					go m.cp.deleteContainer(c.ID)
+				}
 				return nil, fmt.Sprintf("push restore: %v", err)
 			}
 			restores.WithLabelValues("success").Inc()
@@ -402,7 +424,6 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	m.mu.Lock()
 	m.sessions[accessToken] = c
 	m.mu.Unlock()
-	assigned = true
 
 	return c, ""
 }
@@ -413,7 +434,6 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 	if ok {
 		delete(m.sessions, accessToken)
 	}
-	delete(m.assignLocks, accessToken)
 	m.mu.Unlock()
 	if !ok {
 		return nil
@@ -523,10 +543,7 @@ func (m *Manager) evictSessionAsync(accessToken string, c *Container) {
 		}
 		delete(m.sessions, accessToken)
 		m.mu.Unlock()
-		m.evictAndSnapshot(context.Background(), accessToken, c)
-		m.mu.Lock()
-		delete(m.assignLocks, accessToken)
-		m.mu.Unlock()
+		m.evictAndSnapshot(m.lifetime, accessToken, c)
 	}()
 }
 
@@ -659,12 +676,19 @@ func (m *Manager) CleanupAll() {
 	m.assignLocks = map[string]*sync.Mutex{}
 	m.mu.Unlock()
 
+	// Delete containers in parallel
+	var wg sync.WaitGroup
 	for _, c := range all {
-		if !m.cp.verifyContainerName(c) {
-			continue
-		}
-		m.cp.deleteContainer(c.ID)
+		wg.Add(1)
+		go func(c *Container) {
+			defer wg.Done()
+			if !m.cp.verifyContainerName(c) {
+				return
+			}
+			m.cp.deleteContainer(c.ID)
+		}(c)
 	}
+	wg.Wait()
 }
 
 // Finish snapshots every active session in parallel then bulk-deletes any remaining containers.
@@ -672,6 +696,7 @@ func (m *Manager) CleanupAll() {
 func (m *Manager) Finish() {
 	m.finishOnce.Do(func() {
 		close(m.done)
+		m.cancelLifetime()
 		// Wake any GetOrAssign waiters parked on cond so they exit promptly.
 		m.mu.Lock()
 		m.cond.Broadcast()

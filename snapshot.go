@@ -36,28 +36,30 @@ var (
 
 // httpRetry calls fn up to `attempts` times, sleeping `backoff` between
 // calls. fn returns (result, transient, err); transient=true means the
-// error is worth retrying.
-func httpRetry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, bool, error)) (T, error) {
+// error is worth retrying. The returned `transient` distinguishes
+// "exhausted retries on transient errors" (true) from "fn returned a
+// hard error" (false).
+func httpRetry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, bool, error)) (T, bool, error) {
 	var zero T
 	var lastErr error
 	for i := 0; i < attempts; i++ {
 		if i > 0 {
 			select {
 			case <-ctx.Done():
-				return zero, ctx.Err()
+				return zero, true, ctx.Err()
 			case <-time.After(backoff):
 			}
 		}
 		result, transient, err := fn()
 		if err == nil {
-			return result, nil
+			return result, false, nil
 		}
 		lastErr = err
 		if !transient {
-			return zero, err
+			return zero, false, err
 		}
 	}
-	return zero, lastErr
+	return zero, true, lastErr
 }
 
 // ---------------------------------------------------------------------------
@@ -93,9 +95,10 @@ func (b *Buckets) fetch(ctx context.Context, bearer, accessToken, codeExecutionE
 	if err != nil {
 		return nil, err
 	}
-	return httpRetry(ctx, bucketFetchAttempts, restorePushRetryDelay, func() ([]byte, bool, error) {
+	tar, _, err := httpRetry(ctx, bucketFetchAttempts, restorePushRetryDelay, func() ([]byte, bool, error) {
 		return b.fetchOnce(ctx, bearer, accessToken, keyStd)
 	})
+	return tar, err
 }
 
 // fetchOnce returns (bytes, transient, err). 404 → (nil, false, nil)
@@ -155,7 +158,7 @@ func (b *Buckets) put(ctx context.Context, bearer, accessToken, codeExecutionEnc
 	if err != nil {
 		return err
 	}
-	_, err = httpRetry(ctx, bucketPutAttempts, snapshotPutRetryDelay, func() (struct{}, bool, error) {
+	_, _, err = httpRetry(ctx, bucketPutAttempts, snapshotPutRetryDelay, func() (struct{}, bool, error) {
 		return b.putOnce(ctx, bearer, accessToken, body)
 	})
 	return err
@@ -189,21 +192,22 @@ func (b *Buckets) putOnce(ctx context.Context, bearer, accessToken string, body 
 // ---------------------------------------------------------------------------
 
 // pushRestore POSTs the plaintext tar to the container's /restore.
-// Retries transient (5xx, network) failures internally.
-func (m *Manager) pushRestore(ctx context.Context, c *Container, plaintextTar []byte) error {
+// Retries transient (5xx, network) failures internally. Returns
+// (transient, err) so callers can distinguish "flake" from "bad"
+func (m *Manager) pushRestore(ctx context.Context, c *Container, plaintextTar []byte) (bool, error) {
 	if c.httpClient == nil {
-		return fmt.Errorf("no http client for container %s", c.Name)
+		return false, fmt.Errorf("no http client for container %s", c.Name)
 	}
 	body, err := json.Marshal(map[string]string{
 		"tar": base64.StdEncoding.EncodeToString(plaintextTar),
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
-	_, err = httpRetry(ctx, pushRestoreAttempts, restorePushRetryDelay, func() (struct{}, bool, error) {
+	_, transient, err := httpRetry(ctx, pushRestoreAttempts, restorePushRetryDelay, func() (struct{}, bool, error) {
 		return m.pushRestoreOnce(ctx, c, body)
 	})
-	return err
+	return transient, err
 }
 
 func (m *Manager) pushRestoreOnce(ctx context.Context, c *Container, body []byte) (struct{}, bool, error) {

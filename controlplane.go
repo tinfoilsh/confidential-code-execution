@@ -19,14 +19,14 @@ import (
 
 type Controlplane struct {
 	baseURL    string
-	adminKey   string
+	scopedCodeExecAdminKey   string
 	httpClient *http.Client
 }
 
-func NewControlplane(baseURL, adminKey string) *Controlplane {
+func NewControlplane(baseURL, scopedCodeExecAdminKey string) *Controlplane {
 	return &Controlplane{
 		baseURL:    baseURL,
-		adminKey:   adminKey,
+		scopedCodeExecAdminKey:   scopedCodeExecAdminKey,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 }
@@ -44,7 +44,7 @@ func (cp *Controlplane) do(ctx context.Context, method, path string, body any) (
 	if err != nil {
 		return 0, nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+cp.adminKey)
+	req.Header.Set("Authorization", "Bearer "+cp.scopedCodeExecAdminKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "tinfoil-orchestrator/1.0")
 

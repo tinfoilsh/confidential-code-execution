@@ -58,8 +58,10 @@ Manages a warm pool of executor containers via the Tinfoil controlplane API. Rou
 
 ### Run
 
+_Use a scoped admin_api_key with CRD only for containers matching the repo & pattern `code-exec-SHA`_
+
 ```bash
-export ADMIN_API_KEY="..."
+export SCOPED_CODE_EXEC_ADMIN_KEY="..."
 go run .
 ```
 
@@ -74,7 +76,7 @@ go build .
 
 | Variable                   | Default                                | Notes                                                                                                     |
 | -------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `ADMIN_API_KEY`            | _(required)_                           | Tinfoil controlplane bearer token.                                                                        |
+| `SCOPED_CODE_EXEC_ADMIN_KEY`            | _(required)_                           | Tinfoil controlplane bearer token.                                                                        |
 | `CONTROL_PLANE_URL`        | `https://api.tinfoil.sh`               | Controlplane base URL (container CRUD + api_key validation).                                              |
 | `BUCKETS_BASE`             | `https://buckets.tinfoil.sh`           | Buckets base URL (encrypted snapshot store).                                                              |
 | `PORT`                     | `7070`                                 | Manager listen port.                                                                                      |
@@ -82,7 +84,7 @@ go build .
 | `MAX_CONTAINERS`           | `10`                                   | Hard cap on concurrent containers (warm + inflight + sessions).                                           |
 | `POLL_INTERVAL`            | `2`                                    | Seconds between pool-manager ticks. Backs off up to 30s on consecutive controlplane failures.             |
 | `ENVIRONMENT_REPO`         | `tinfoilsh/code-execution-environment` | Source repo for the executor image.                                                                       |
-| `ENVIRONMENT_TAG`          | `v0.0.11`                              | Image tag to deploy.                                                                                      |
+| `ENVIRONMENT_TAG`          | `v0.0.12`                              | Image tag to deploy.                                                                                      |
 | `IDLE_TIMEOUT`             | `60`                                   | Seconds of session inactivity before snapshot+evict.                                                      |
 | `EVICTION_POLL`            | `30`                                   | Seconds between idle-evictor scans.                                                                       |
 | `WARM_POOL_WAIT_TIMEOUT`   | `10`                                   | Seconds a `tools/call` will wait for a warm container before returning an at-capacity error.              |
