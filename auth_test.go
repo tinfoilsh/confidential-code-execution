@@ -49,7 +49,7 @@ func newFakeValidateKey(valid map[string]bool, rejectStatus int) *httptest.Serve
 func newAuthTestManager(t *testing.T, cpURL string) *Manager {
 	t.Helper()
 	return NewManager(ManagerConfig{
-		AdminAPIKey:     "x",
+		ScopedCodeExecAdminKey:     "x",
 		ControlPlaneURL: cpURL,
 		IdleTimeout:     time.Hour,
 	})

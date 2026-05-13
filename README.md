@@ -61,7 +61,7 @@ Manages a warm pool of executor containers via the Tinfoil controlplane API. Rou
 _Use a scoped admin_api_key with CRD only for containers matching the repo & pattern `code-exec-SHA`_
 
 ```bash
-export ADMIN_API_KEY="..."
+export SCOPED_CODE_EXEC_ADMIN_KEY="..."
 go run .
 ```
 
@@ -76,7 +76,7 @@ go build .
 
 | Variable                   | Default                                | Notes                                                                                                     |
 | -------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `ADMIN_API_KEY`            | _(required)_                           | Tinfoil controlplane bearer token.                                                                        |
+| `SCOPED_CODE_EXEC_ADMIN_KEY`            | _(required)_                           | Tinfoil controlplane bearer token.                                                                        |
 | `CONTROL_PLANE_URL`        | `https://api.tinfoil.sh`               | Controlplane base URL (container CRUD + api_key validation).                                              |
 | `BUCKETS_BASE`             | `https://buckets.tinfoil.sh`           | Buckets base URL (encrypted snapshot store).                                                              |
 | `PORT`                     | `7070`                                 | Manager listen port.                                                                                      |

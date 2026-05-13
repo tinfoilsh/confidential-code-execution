@@ -47,7 +47,7 @@ func (c *Container) bumpActivity() {
 }
 
 type ManagerConfig struct {
-	AdminAPIKey     string
+	ScopedCodeExecAdminKey string
 	ControlPlaneURL string // CONTROL_PLANE_URL
 	BucketsBase     string // BUCKETS_BASE
 	PoolSize        int
@@ -99,7 +99,7 @@ type Manager struct {
 func NewManager(cfg ManagerConfig) *Manager {
 	m := &Manager{
 		cfg:         cfg,
-		cp:          NewControlplane(cfg.ControlPlaneURL, cfg.AdminAPIKey),
+		cp:          NewControlplane(cfg.ControlPlaneURL, cfg.ScopedCodeExecAdminKey),
 		buckets:     NewBuckets(cfg.BucketsBase),
 		sessions:    map[string]*Container{},
 		assignLocks: map[string]*sync.Mutex{},

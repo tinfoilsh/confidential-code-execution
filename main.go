@@ -68,13 +68,13 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 }
 
 func main() {
-	adminAPIKey := os.Getenv("ADMIN_API_KEY")
-	if adminAPIKey == "" {
-		log.Fatal("ADMIN_API_KEY is required")
+	scopedCodeExecAdminKey := os.Getenv("SCOPED_CODE_EXEC_ADMIN_KEY")
+	if scopedCodeExecAdminKey == "" {
+		log.Fatal("SCOPED_CODE_EXEC_ADMIN_KEY is required")
 	}
 
 	cfg := ManagerConfig{
-		AdminAPIKey:            adminAPIKey,
+		ScopedCodeExecAdminKey: scopedCodeExecAdminKey,
 		ControlPlaneURL:        envStr("CONTROL_PLANE_URL", "https://api.tinfoil.sh"),
 		BucketsBase:            envStr("BUCKETS_BASE", "https://buckets.tinfoil.sh"),
 		PoolSize:               envInt("POOL_SIZE", 3),
