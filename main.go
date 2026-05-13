@@ -125,7 +125,9 @@ func main() {
 	// to snapshot active sessions and bulk-delete containers.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-sigCh
 		log.Println("orchestrator: caught signal, finalizing...")
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -138,4 +140,6 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	// Wait here so the process doesn't exit mid-cleanup
+	<-shutdownDone
 }
