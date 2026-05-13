@@ -16,3 +16,4 @@ shim:
   upstream-port: 7070
   paths:
     - /mcp
+    - /metrics
