@@ -285,7 +285,7 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		return c, ""
 	}
 	// Capacity check before lockSession so a flood of unique tokens
-	// can't grow assignLocks past MaxContainers.
+	// fails fast without churning warm-pool state.
 	if len(m.sessions) >= m.cfg.MaxContainers {
 		m.mu.Unlock()
 		return nil, fmt.Sprintf("at capacity (%d sessions)", m.cfg.MaxContainers)
@@ -296,25 +296,11 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	sl.Lock()
 	defer sl.Unlock()
 
-	// If we never end up registering a session, drop the assignLocks so it doesn't grow the map
-	assigned := false
-	defer func() {
-		if assigned {
-			return
-		}
-		m.mu.Lock()
-		if _, ok := m.sessions[accessToken]; !ok {
-			delete(m.assignLocks, accessToken)
-		}
-		m.mu.Unlock()
-	}()
-
 	// Re-check after acquiring sl: another goroutine may have assigned
 	// while we were waiting.
 	m.mu.Lock()
 	if c, ok := m.sessions[accessToken]; ok {
 		m.mu.Unlock()
-		assigned = true
 		return c, ""
 	}
 	m.mu.Unlock()
@@ -411,7 +397,6 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	m.mu.Lock()
 	m.sessions[accessToken] = c
 	m.mu.Unlock()
-	assigned = true
 
 	return c, ""
 }
@@ -422,7 +407,6 @@ func (m *Manager) CleanupSession(accessToken string) *Container {
 	if ok {
 		delete(m.sessions, accessToken)
 	}
-	delete(m.assignLocks, accessToken)
 	m.mu.Unlock()
 	if !ok {
 		return nil
@@ -533,9 +517,6 @@ func (m *Manager) evictSessionAsync(accessToken string, c *Container) {
 		delete(m.sessions, accessToken)
 		m.mu.Unlock()
 		m.evictAndSnapshot(context.Background(), accessToken, c)
-		m.mu.Lock()
-		delete(m.assignLocks, accessToken)
-		m.mu.Unlock()
 	}()
 }
 
