@@ -74,24 +74,24 @@ go build .
 
 ### Environment variables
 
-| Variable                   | Default                                | Notes                                                                                                     |
-| -------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `SCOPED_CODE_EXEC_ADMIN_KEY`            | _(required)_                           | Tinfoil controlplane bearer token.                                                                        |
-| `CONTROL_PLANE_URL`        | `https://api.tinfoil.sh`               | Controlplane base URL (container CRUD + api_key validation).                                              |
-| `BUCKETS_BASE`             | `https://buckets.tinfoil.sh`           | Buckets base URL (encrypted snapshot store).                                                              |
-| `PORT`                     | `7070`                                 | Manager listen port.                                                                                      |
-| `POOL_SIZE`                | `3`                                    | Target warm pool size.                                                                                    |
-| `MAX_CONTAINERS`           | `10`                                   | Hard cap on concurrent containers (warm + inflight + sessions).                                           |
-| `POLL_INTERVAL`            | `2`                                    | Seconds between pool-manager ticks. Backs off up to 30s on consecutive controlplane failures.             |
-| `ENVIRONMENT_REPO`         | `tinfoilsh/code-execution-environment` | Source repo for the executor image.                                                                       |
-| `ENVIRONMENT_TAG`          | `v0.0.12`                              | Image tag to deploy.                                                                                      |
-| `IDLE_TIMEOUT`             | `60`                                   | Seconds of session inactivity before snapshot+evict.                                                      |
-| `EVICTION_POLL`            | `30`                                   | Seconds between idle-evictor scans.                                                                       |
-| `WARM_POOL_WAIT_TIMEOUT`   | `10`                                   | Seconds a `tools/call` will wait for a warm container before returning an at-capacity error.              |
-| `HEALTH_CHECK_INTERVAL`    | `15`                                   | Seconds between `/health` probes of warm and session containers.                                          |
-| `MAX_HEALTH_FAILURES`      | `3`                                    | Consecutive `/health` failures before evicting a container (warm: delete; session: snapshot then delete). |
-| `MAX_CONCURRENT_SNAPSHOTS` | `4`                                    | Cap on in-memory snapshot/restore tar buffers. Backstop against OOM under load.                           |
-| `SHUTDOWN_DEADLINE`        | `25`                                   | Seconds spent snapshotting sessions on SIGTERM before bulk-delete. Tune per platform grace period.        |
+| Variable                     | Default                                | Notes                                                                                                     |
+| ---------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `SCOPED_CODE_EXEC_ADMIN_KEY` | _(required)_                           | Tinfoil controlplane bearer token.                                                                        |
+| `CONTROL_PLANE_URL`          | `https://api.tinfoil.sh`               | Controlplane base URL (container CRUD + api_key validation).                                              |
+| `BUCKETS_BASE`               | `https://buckets.tinfoil.sh`           | Buckets base URL (encrypted snapshot store).                                                              |
+| `PORT`                       | `7070`                                 | Manager listen port.                                                                                      |
+| `POOL_SIZE`                  | `3`                                    | Target warm pool size.                                                                                    |
+| `MAX_CONTAINERS`             | `10`                                   | Hard cap on concurrent containers (warm + inflight + sessions).                                           |
+| `POLL_INTERVAL`              | `2`                                    | Seconds between pool-manager ticks. Backs off up to 30s on consecutive controlplane failures.             |
+| `ENVIRONMENT_REPO`           | `tinfoilsh/code-execution-environment` | Source repo for the executor image.                                                                       |
+| `ENVIRONMENT_TAG`            | `v0.0.12`                              | Image tag to deploy.                                                                                      |
+| `IDLE_TIMEOUT`               | `60`                                   | Seconds of session inactivity before snapshot+evict.                                                      |
+| `EVICTION_POLL`              | `30`                                   | Seconds between idle-evictor scans.                                                                       |
+| `WARM_POOL_WAIT_TIMEOUT`     | `10`                                   | Seconds a `tools/call` will wait for a warm container before returning an at-capacity error.              |
+| `HEALTH_CHECK_INTERVAL`      | `15`                                   | Seconds between `/health` probes of warm and session containers.                                          |
+| `MAX_HEALTH_FAILURES`        | `3`                                    | Consecutive `/health` failures before evicting a container (warm: delete; session: snapshot then delete). |
+| `MAX_CONCURRENT_SNAPSHOTS`   | `4`                                    | Cap on in-memory snapshot/restore tar buffers. Backstop against OOM under load.                           |
+| `SHUTDOWN_DEADLINE`          | `25`                                   | Seconds spent snapshotting sessions on SIGTERM before bulk-delete. Tune per platform grace period.        |
 
 Build tags:
 
@@ -133,25 +133,31 @@ curl -s -X POST localhost:7070/mcp \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 ```
 
-`tools/call` requires two 64-hex session tokens and a user api_key as the
+`tools/call` requires three session headers and a user api_key as the
 `Authorization` bearer (validated against the controlplane; in `-tags dev`
 builds the validation is skipped but the bearer is still used for buckets
 auth on snapshot/restore):
 
+| Header                                  | Format                                           | Notes                                                                                                  |
+| --------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| `X-Code-Execution-Access-Token`         | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Session identifier. Reuse across calls to hit the same session (state persists in `/workspace`).       |
+| `X-Code-Execution-Container-Auth-Token` | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Per-request auth to the underlying executor. Any 64-hex value works for testing.                       |
+| `X-Code-Execution-Encryption-Key`       | 43 base64url chars (32 bytes, unpadded)          | Wraps the session snapshot key. Frozen at first assignment — changing it after that returns an error.  |
+| `Authorization`                         | `Bearer <api_key>`                               | Validated by the controlplane (skipped in `-tags dev`); reused as the buckets bearer for snapshot I/O. |
+
 ```bash
 # Generat an access token w/ openssl rand -hex 32
+# Generate an encryption key w/ openssl rand 32 | base64 | tr '+/' '-_' | tr -d '='
 # Can use a random auth token for testing
 
-curl -s -X POST localhost:7070/mcp \
+curl -s -X POST https://confidential-code-execution.debug.tinfoil.containers.tinfoil.dev/mcp \
   -H 'Content-Type: application/json' \
   -H "X-Code-Execution-Access-Token: $ACCESS_TOKEN" \
   -H "X-Code-Execution-Container-Auth-Token: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+  -H "X-Code-Execution-Encryption-Key: $ENCRYPTION_KEY" \
   -H "Authorization: Bearer $TINFOIL_API_KEY" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bash","arguments":{"command":"echo hello from sandbox; uname -a"}}}'
 ```
-
-Reuse the same `X-Code-Execution-Access-Token` across calls to hit the
-same session (state persists in `/workspace`).
 
 Other endpoints:
 
