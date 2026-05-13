@@ -12,6 +12,18 @@ var hex64Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // 32 bytes encoded as base64url with no padding
 var base64Url32Re = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 
+// codeExecMetaKey is the params._meta sub-key the router uses to ship
+// the three per-request orchestrator credentials
+//
+//	"_meta": {
+//	  "tinfoil_code_exec": {
+//	    "accessToken":        "<64 hex>",
+//	    "encryptionKey":      "<43-char base64url>",
+//	    "containerAuthToken": "<64 hex>"
+//	  }
+//	}
+const codeExecMetaKey = "tinfoil_code_exec"
+
 type jsonRPCRequest struct {
 	JSONRPC string         `json:"jsonrpc"`
 	ID      any            `json:"id,omitempty"`
@@ -58,33 +70,14 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		return http.StatusOK, resp
 
 	case "tools/call":
-		accessToken := headers.Get("X-Code-Execution-Access-Token")
-		if accessToken == "" {
-			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token header is required"}
+		secrets, rpcErr := extractCodeExecSecrets(req.Params)
+		if rpcErr != nil {
+			resp.Error = rpcErr
 			return http.StatusBadRequest, resp
 		}
-		if !hex64Re.MatchString(accessToken) {
-			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Access-Token has invalid format"}
-			return http.StatusBadRequest, resp
-		}
-		containerAuthToken := headers.Get("X-Code-Execution-Container-Auth-Token")
-		if containerAuthToken == "" {
-			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Container-Auth-Token header is required"}
-			return http.StatusBadRequest, resp
-		}
-		if !hex64Re.MatchString(containerAuthToken) {
-			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Container-Auth-Token has invalid format"}
-			return http.StatusBadRequest, resp
-		}
-		encryptionKey := headers.Get("X-Code-Execution-Encryption-Key")
-		if encryptionKey == "" {
-			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Encryption-Key header is required"}
-			return http.StatusBadRequest, resp
-		}
-		if !base64Url32Re.MatchString(encryptionKey) {
-			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Encryption-Key has invalid format"}
-			return http.StatusBadRequest, resp
-		}
+		accessToken := secrets.accessToken
+		containerAuthToken := secrets.containerAuthToken
+		encryptionKey := secrets.encryptionKey
 		bearer := extractBearer(headers.Get("Authorization"))
 		if err := m.AuthorizeSession(ctx, bearer); err != nil {
 			if errors.Is(err, ErrAuthRequired) {
@@ -123,4 +116,51 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		resp.Error = &rpcError{Code: -32601, Message: "method not found: " + req.Method}
 		return http.StatusBadRequest, resp
 	}
+}
+
+type codeExecSecrets struct {
+	accessToken        string
+	containerAuthToken string
+	encryptionKey      string
+}
+
+// extractCodeExecSecrets pulls the three per-request orchestrator
+// credentials out of params._meta and validates each one's wire format.
+// Returns a populated codeExecSecrets value on success, or an
+// MCP-shaped rpcError describing the first failure.
+func extractCodeExecSecrets(params map[string]any) (codeExecSecrets, *rpcError) {
+	meta, _ := params["_meta"].(map[string]any)
+	if meta == nil {
+		return codeExecSecrets{}, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + " is required"}
+	}
+	block, _ := meta[codeExecMetaKey].(map[string]any)
+	if block == nil {
+		return codeExecSecrets{}, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + " is required"}
+	}
+	accessToken, _ := block["accessToken"].(string)
+	if accessToken == "" {
+		return codeExecSecrets{}, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + ".accessToken is required"}
+	}
+	if !hex64Re.MatchString(accessToken) {
+		return codeExecSecrets{}, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + ".accessToken has invalid format"}
+	}
+	containerAuthToken, _ := block["containerAuthToken"].(string)
+	if containerAuthToken == "" {
+		return codeExecSecrets{}, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + ".containerAuthToken is required"}
+	}
+	if !hex64Re.MatchString(containerAuthToken) {
+		return codeExecSecrets{}, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + ".containerAuthToken has invalid format"}
+	}
+	encryptionKey, _ := block["encryptionKey"].(string)
+	if encryptionKey == "" {
+		return codeExecSecrets{}, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + ".encryptionKey is required"}
+	}
+	if !base64Url32Re.MatchString(encryptionKey) {
+		return codeExecSecrets{}, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + ".encryptionKey has invalid format"}
+	}
+	return codeExecSecrets{
+		accessToken:        accessToken,
+		containerAuthToken: containerAuthToken,
+		encryptionKey:      encryptionKey,
+	}, nil
 }
