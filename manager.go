@@ -373,10 +373,20 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 		if tarBytes == nil {
 			restores.WithLabelValues("empty").Inc()
 		} else {
-			if err := m.pushRestore(ctx, c, tarBytes); err != nil {
+			transient, err := m.pushRestore(ctx, c, tarBytes)
+			if err != nil {
 				restores.WithLabelValues("failure").Inc()
-				c.setStatus("failed")
-				go m.cp.deleteContainer(c.ID)
+				if transient {
+					// Exhausted retries on a network / 5xx flake.
+					m.mu.Lock()
+					m.warmPool = append(m.warmPool, c)
+					m.cond.Broadcast()
+					m.mu.Unlock()
+				} else {
+					// Hard failure from container
+					c.setStatus("failed")
+					go m.cp.deleteContainer(c.ID)
+				}
 				return nil, fmt.Sprintf("push restore: %v", err)
 			}
 			restores.WithLabelValues("success").Inc()
