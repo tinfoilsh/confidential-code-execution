@@ -138,16 +138,28 @@ func (m *Manager) replenishPool() []*Container {
 
 	var created []*Container
 	for range needed {
+		// Skip the next createContainer if shutdown's already started.
+		select {
+		case <-m.done:
+			return created
+		default:
+		}
 		c, err := m.cp.createContainer(m.cfg.EnvironmentRepo, m.cfg.EnvironmentTag)
 		if err != nil {
 			break
 		}
-		created = append(created, c)
-	}
-	if len(created) > 0 {
+		// Register immediately
 		m.mu.Lock()
-		m.inflight = append(m.inflight, created...)
+		select {
+		case <-m.done:
+			m.mu.Unlock()
+			go m.cp.deleteContainer(c.ID)
+			return created
+		default:
+		}
+		m.inflight = append(m.inflight, c)
 		m.mu.Unlock()
+		created = append(created, c)
 	}
 	return created
 }
