@@ -58,6 +58,8 @@ Manages a warm pool of executor containers via the Tinfoil controlplane API. Rou
 
 ### Run
 
+_Use a scoped admin_api_key with CRD only for containers matching the repo & pattern `code-exec-SHA`_
+
 ```bash
 export ADMIN_API_KEY="..."
 go run .
