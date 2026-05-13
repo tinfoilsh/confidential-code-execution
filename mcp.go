@@ -9,6 +9,9 @@ import (
 
 var hex64Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// 32 bytes encoded as base64url with no padding
+var base64Url32Re = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+
 type jsonRPCRequest struct {
 	JSONRPC string         `json:"jsonrpc"`
 	ID      any            `json:"id,omitempty"`
@@ -73,6 +76,15 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Container-Auth-Token has invalid format"}
 			return http.StatusBadRequest, resp
 		}
+		encryptionKey := headers.Get("X-Code-Execution-Encryption-Key")
+		if encryptionKey == "" {
+			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Encryption-Key header is required"}
+			return http.StatusBadRequest, resp
+		}
+		if !base64Url32Re.MatchString(encryptionKey) {
+			resp.Error = &rpcError{Code: -32602, Message: "X-Code-Execution-Encryption-Key has invalid format"}
+			return http.StatusBadRequest, resp
+		}
 		bearer := extractBearer(headers.Get("Authorization"))
 		if err := m.AuthorizeSession(ctx, bearer); err != nil {
 			if errors.Is(err, ErrAuthRequired) {
@@ -84,7 +96,7 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		}
 		// Stash on ctx. Encryption key + bearer are cached on the container by the manager.
 		// AuthToken only exists per request
-		ctx = WithCodeExecutionEncryptionKey(ctx, headers.Get("X-Code-Execution-Encryption-Key"))
+		ctx = WithCodeExecutionEncryptionKey(ctx, encryptionKey)
 		ctx = WithBearer(ctx, bearer)
 		ctx = WithContainerAuthToken(ctx, containerAuthToken)
 		name, _ := req.Params["name"].(string)
