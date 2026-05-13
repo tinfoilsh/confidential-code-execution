@@ -121,16 +121,17 @@ func main() {
 		writeJSON(w, status, resp)
 	})
 
-	// On SIGINT/SIGTERM, run Finish() to delete all containers, then shut down.
+	// On SIGINT/SIGTERM, stop accepting new requests, then run Finish()
+	// to snapshot active sessions and bulk-delete containers.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
 		log.Println("orchestrator: caught signal, finalizing...")
-		mgr.Finish()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		srv.Shutdown(ctx)
+		mgr.Finish()
 	}()
 
 	log.Printf("orchestrator listening on :%d", port)

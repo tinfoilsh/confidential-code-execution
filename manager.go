@@ -81,6 +81,10 @@ type Manager struct {
 	finishOnce  sync.Once
 	done        chan struct{} // closed by Finish to signal shutdown
 
+	// Cancelled by Finish so any in-flight evictSessionAsync goroutine aborts
+	lifetime       context.Context
+	cancelLifetime context.CancelFunc
+
 	// Bearers that recently passed validate-key
 	authCacheMu sync.Mutex
 	authCache   map[string]time.Time
@@ -103,6 +107,7 @@ func NewManager(cfg ManagerConfig) *Manager {
 		authCache:   map[string]time.Time{},
 		snapshotSem: make(chan struct{}, cfg.MaxConcurrentSnapshots),
 	}
+	m.lifetime, m.cancelLifetime = context.WithCancel(context.Background())
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -526,7 +531,7 @@ func (m *Manager) evictSessionAsync(accessToken string, c *Container) {
 		}
 		delete(m.sessions, accessToken)
 		m.mu.Unlock()
-		m.evictAndSnapshot(context.Background(), accessToken, c)
+		m.evictAndSnapshot(m.lifetime, accessToken, c)
 	}()
 }
 
@@ -659,12 +664,19 @@ func (m *Manager) CleanupAll() {
 	m.assignLocks = map[string]*sync.Mutex{}
 	m.mu.Unlock()
 
+	// Delete containers in parallel
+	var wg sync.WaitGroup
 	for _, c := range all {
-		if !m.cp.verifyContainerName(c) {
-			continue
-		}
-		m.cp.deleteContainer(c.ID)
+		wg.Add(1)
+		go func(c *Container) {
+			defer wg.Done()
+			if !m.cp.verifyContainerName(c) {
+				return
+			}
+			m.cp.deleteContainer(c.ID)
+		}(c)
 	}
+	wg.Wait()
 }
 
 // Finish snapshots every active session in parallel then bulk-deletes any remaining containers.
@@ -672,6 +684,7 @@ func (m *Manager) CleanupAll() {
 func (m *Manager) Finish() {
 	m.finishOnce.Do(func() {
 		close(m.done)
+		m.cancelLifetime()
 		// Wake any GetOrAssign waiters parked on cond so they exit promptly.
 		m.mu.Lock()
 		m.cond.Broadcast()
