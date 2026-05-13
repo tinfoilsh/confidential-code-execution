@@ -93,7 +93,12 @@ go build .
 
 Build tags:
 
-- `-tags dev` — disables enclave attestation + TLS pinning (`proxy_dev.go`) and api_key validation (`auth_dev.go`). Local dev only; never ship a binary built with this tag.
+- `-tags dev` — disables enclave attestation + TLS pinning (`proxy_dev.go`) and api_key validation (`auth_dev.go`).
+
+Specifically:
+
+1. `auth_dev.go` skips validating that the bearer is valid to even hit this MCP. It does not prevent buckets from failing though, since buckets also takes this bearer.
+2. `proxy_dev.go` skips attestation & TLS pinning for the environment container
 
 ### API
 
