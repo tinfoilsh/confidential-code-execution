@@ -150,7 +150,7 @@ curl -s -X POST localhost:7070/mcp \
 # Generate an encryption key:  openssl rand 32 | base64 | tr '+/' '-_' | tr -d '='
 # Any 64-hex value works as containerAuthToken for testing.
 
-curl -s -X POST https://confidential-code-execution.debug.tinfoil.containers.tinfoil.dev/mcp \
+curl -s -X POST localhost:7070/mcp \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $TINFOIL_API_KEY" \
   -d "$(cat <<EOF
