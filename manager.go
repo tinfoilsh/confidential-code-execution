@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"log"
@@ -260,14 +261,22 @@ func (m *Manager) GetOrAssign(ctx context.Context, accessToken string, isConnect
 	codeExecutionEncryptionKey := sessionCodeExecutionEncryptionKey(ctx)
 	bearer := sessionBearer(ctx)
 
-	// Fast path: existing session — no per-session lock needed since
-	// we're just refreshing keys on a container that's already in the map.
+	// Fast path: existing session.
+	// Slow path: The encryption key is frozen at first assignment to prevent an attacker
+	// with the accessToken from changing this.
+	// The bearer is allowed to rotate
 	m.mu.Lock()
 	if c, ok := m.sessions[accessToken]; ok {
 		m.mu.Unlock()
 		c.mu.Lock()
-		if codeExecutionEncryptionKey != "" {
-			c.CodeExecutionEncryptionKey = codeExecutionEncryptionKey
+		if codeExecutionEncryptionKey != "" &&
+			c.CodeExecutionEncryptionKey != "" &&
+			subtle.ConstantTimeCompare(
+				[]byte(c.CodeExecutionEncryptionKey),
+				[]byte(codeExecutionEncryptionKey),
+			) != 1 {
+			c.mu.Unlock()
+			return nil, "encryption key mismatch for existing session"
 		}
 		if bearer != "" {
 			c.Bearer = bearer
