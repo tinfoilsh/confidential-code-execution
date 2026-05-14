@@ -18,16 +18,16 @@ import (
 )
 
 type Controlplane struct {
-	baseURL    string
-	scopedCodeExecAdminKey   string
-	httpClient *http.Client
+	baseURL                string
+	scopedCodeExecAdminKey string
+	httpClient             *http.Client
 }
 
 func NewControlplane(baseURL, scopedCodeExecAdminKey string) *Controlplane {
 	return &Controlplane{
-		baseURL:    baseURL,
-		scopedCodeExecAdminKey:   scopedCodeExecAdminKey,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		baseURL:                baseURL,
+		scopedCodeExecAdminKey: scopedCodeExecAdminKey,
+		httpClient:             &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -73,9 +73,10 @@ func (cp *Controlplane) createContainer(repo, tag string) (*Container, error) {
 	}
 	name := "code-exec-" + hex.EncodeToString(suffix)
 	body := map[string]any{
-		"name": name,
-		"repo": repo,
-		"tag":  tag,
+		"name":       name,
+		"repo":       repo,
+		"tag":        tag,
+		"group_name": "__system:code-exec",
 	}
 	status, raw, err := cp.do(context.Background(), "POST", "/api/containers", body)
 	if err != nil {
