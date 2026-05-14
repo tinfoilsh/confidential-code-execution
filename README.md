@@ -84,7 +84,7 @@ go build .
 | `MAX_CONTAINERS`             | `10`                                   | Hard cap on concurrent containers (warm + inflight + sessions).                                           |
 | `POLL_INTERVAL`              | `2`                                    | Seconds between pool-manager ticks. Backs off up to 30s on consecutive controlplane failures.             |
 | `ENVIRONMENT_REPO`           | `tinfoilsh/code-execution-environment` | Source repo for the executor image.                                                                       |
-| `ENVIRONMENT_TAG`            | `v0.0.12`                              | Image tag to deploy.                                                                                      |
+| `ENVIRONMENT_TAG`            | `v0.0.13`                              | Image tag to deploy.                                                                                      |
 | `IDLE_TIMEOUT`               | `60`                                   | Seconds of session inactivity before snapshot+evict.                                                      |
 | `EVICTION_POLL`              | `30`                                   | Seconds between idle-evictor scans.                                                                       |
 | `WARM_POOL_WAIT_TIMEOUT`     | `10`                                   | Seconds a `tools/call` will wait for a warm container before returning an at-capacity error.              |
