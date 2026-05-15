@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 )
@@ -13,15 +14,26 @@ var hex64Re = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var base64Url32Re = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 
 // codeExecMetaKey is the params._meta sub-key the router uses to ship
-// the three per-request orchestrator credentials
+// the three per-request orchestrator credentials, plus the optional
+// uploads manifest:
 //
 //	"_meta": {
 //	  "tinfoil_code_exec": {
 //	    "accessToken":        "<64 hex>",
 //	    "encryptionKey":      "<43-char base64url>",
-//	    "containerAuthToken": "<64 hex>"
+//	    "containerAuthToken": "<64 hex>",
+//	    "uploads": [
+//	      {"fileAccessToken": "<64 hex>", "filename": "report.pdf", "sha256": "<64 hex>"},
+//	      ...
+//	    ]
 //	  }
 //	}
+//
+// uploads is optional. Absent = leave /user-uploads alone; present (even
+// empty) = reconcile /user-uploads to exactly match the manifest.
+// fileAccessToken is used to lookup from bucket.
+// filename is used for the filename
+// sha256 is used for fast path check against sandbox environment
 const codeExecMetaKey = "tinfoil_code_exec"
 
 type jsonRPCRequest struct {
@@ -92,6 +104,20 @@ func HandleMCPRequest(ctx context.Context, m *Manager, headers http.Header, req 
 		ctx = WithCodeExecutionEncryptionKey(ctx, encryptionKey)
 		ctx = WithBearer(ctx, bearer)
 		ctx = WithContainerAuthToken(ctx, containerAuthToken)
+
+		uploads, uploadsErr := extractUploads(req.Params)
+		if uploadsErr != nil {
+			resp.Error = uploadsErr
+			return http.StatusBadRequest, resp
+		}
+		// non-nil is valid - no uploads
+		if uploads != nil {
+			if err := m.SyncUploads(ctx, accessToken, uploads); err != nil {
+				resp.Error = &rpcError{Code: -32603, Message: "sync-uploads failed: " + err.Error()}
+				return http.StatusInternalServerError, resp
+			}
+		}
+
 		name, _ := req.Params["name"].(string)
 		args, _ := req.Params["arguments"].(map[string]any)
 		handler, ok := ToolHandlers[name]
@@ -163,4 +189,53 @@ func extractCodeExecSecrets(params map[string]any) (codeExecSecrets, *rpcError) 
 		containerAuthToken: containerAuthToken,
 		encryptionKey:      encryptionKey,
 	}, nil
+}
+
+// extractUploads pulls _meta.tinfoil_code_exec.uploads, validating each
+// entry's wire format. The presence of the uploads key (not its length)
+// is what triggers a /sync-uploads call:
+//   - field absent  → returns (nil, nil), caller skips SyncUploads
+//   - field present → returns (non-nil slice, nil), caller calls SyncUploads
+//   - malformed     → returns (nil, *rpcError) describing the problem
+func extractUploads(params map[string]any) ([]uploadFile, *rpcError) {
+	meta, _ := params["_meta"].(map[string]any)
+	if meta == nil {
+		return nil, nil
+	}
+	block, _ := meta[codeExecMetaKey].(map[string]any)
+	if block == nil {
+		return nil, nil
+	}
+	raw, ok := block["uploads"]
+	if !ok {
+		return nil, nil
+	}
+	rawList, ok := raw.([]any)
+	if !ok {
+		return nil, &rpcError{Code: -32602, Message: "params._meta." + codeExecMetaKey + ".uploads must be an array"}
+	}
+	files := make([]uploadFile, 0, len(rawList))
+	for i, item := range rawList {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d] must be an object", codeExecMetaKey, i)}
+		}
+		fileAccessToken, _ := entry["fileAccessToken"].(string)
+		filename, _ := entry["filename"].(string)
+		sha, _ := entry["sha256"].(string)
+		if fileAccessToken == "" {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].fileAccessToken is required", codeExecMetaKey, i)}
+		}
+		if !hex64Re.MatchString(fileAccessToken) {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].fileAccessToken has invalid format", codeExecMetaKey, i)}
+		}
+		if filename == "" {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].filename is required", codeExecMetaKey, i)}
+		}
+		if sha == "" || !hex64Re.MatchString(sha) {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].sha256 must be 64 hex chars", codeExecMetaKey, i)}
+		}
+		files = append(files, uploadFile{FileAccessToken: fileAccessToken, Filename: filename, Sha256: sha})
+	}
+	return files, nil
 }
