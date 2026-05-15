@@ -135,11 +135,12 @@ curl -s -X POST localhost:7070/mcp \
 
 `tools/call` requires three credentials nested under `params._meta.tinfoil_code_exec` and a user api_key as the `Authorization` bearer (validated against the controlplane; in `-tags dev` builds the validation is skipped but the bearer is still used for buckets auth on snapshot/restore):
 
-| `params._meta.tinfoil_code_exec` field | Format                                           | Notes                                                                                                 |
-| -------------------------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| `accessToken`                          | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Session identifier. Reuse across calls to hit the same session (state persists in `/workspace`).      |
-| `containerAuthToken`                   | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Per-request auth to the underlying executor. Any 64-hex value works for testing.                      |
-| `encryptionKey`                        | 43 base64url chars (32 bytes, unpadded)          | Wraps the session snapshot key. Frozen at first assignment — changing it after that returns an error. |
+| `params._meta.tinfoil_code_exec` field | Format                                           | Notes                                                                                                                                                            |
+| -------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `accessToken`                          | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Session identifier. Reuse across calls to hit the same session (state persists in `/workspace`).                                                                 |
+| `containerAuthToken`                   | 64 hex chars (32 bytes) — `openssl rand -hex 32` | Per-request auth to the underlying executor. Any 64-hex value works for testing.                                                                                 |
+| `encryptionKey`                        | 43 base64url chars (32 bytes, unpadded)          | Wraps the session snapshot key. Frozen at first assignment — changing it after that returns an error. Same key wraps every uploaded file's bucket entry as well. |
+| `uploads` (optional)                   | Array of `{fileAccessToken, filename, sha256}`   | Reconciles `/user-uploads` to exactly this manifest. Field absent → leave alone; empty array → clear all; non-empty → add/replace as needed.                     |
 
 | Header          | Format             | Notes                                                                                                  |
 | --------------- | ------------------ | ------------------------------------------------------------------------------------------------------ |
@@ -173,6 +174,65 @@ curl -s -X POST localhost:7070/mcp \
 EOF
 )"
 ```
+
+#### User uploads
+
+`/user-uploads` is a separate tmpfs inside the executor (read-only to the
+model's bash, uid 1001; writable only by the executor process, uid 1000).
+The manager reconciles it to the `uploads` manifest before each
+`tools/call` via a two-step content-addressed protocol — files already
+present at the right sha256 are not re-fetched.
+
+To attach a file:
+
+1. PUT the encrypted bytes into buckets under any 64-hex key — that key
+   becomes the file's `fileAccessToken`. Each file gets its own key, but
+   they're all wrapped by the same per-session `encryptionKey`.
+2. Include `{fileAccessToken, filename, sha256}` in the `uploads` array
+   on the next `tools/call`. The manager pulls only what's missing,
+   verifies the sha, and writes it under `filename`.
+
+```bash
+# 1. upload one file to buckets
+FILE_ACCESS_TOKEN=$(openssl rand -hex 32)
+SHA=$(sha256sum hello.txt | cut -d' ' -f1)
+ENC_KEY_STD=$(echo "$ENCRYPTION_KEY===" | tr '_-' '/+')   # url-safe → standard
+curl -s -X PUT "$BUCKETS_BASE/items/$FILE_ACCESS_TOKEN" \
+  -H "Authorization: Bearer $TINFOIL_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d "{\"value\":\"$(base64 < hello.txt)\",\"encryption_keys\":[\"$ENC_KEY_STD\"]}"
+
+# 2. attach + ls inside the enclave
+curl -s -X POST localhost:7070/mcp \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $TINFOIL_API_KEY" \
+  -d "$(cat <<EOF
+{
+  "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+  "params": {
+    "_meta": {
+      "tinfoil_code_exec": {
+        "accessToken": "$ACCESS_TOKEN",
+        "containerAuthToken": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "encryptionKey": "$ENCRYPTION_KEY",
+        "uploads": [
+          {"fileAccessToken": "$FILE_ACCESS_TOKEN", "filename": "hello.txt", "sha256": "$SHA"}
+        ]
+      }
+    },
+    "name": "bash",
+    "arguments": {"command": "ls -la /user-uploads && cat /user-uploads/hello.txt"}
+  }
+}
+EOF
+)"
+```
+
+Multiple files: PUT each one under its own `fileAccessToken` (same
+`encryptionKey` is fine), then list them all in `uploads` on the call.
+
+End-to-end reference: `test-uploads.py` runs the full flow (upload → call
+→ verify ro+uid → second file in same session) — `python3 test-uploads.py`.
 
 Other endpoints:
 
@@ -227,6 +287,14 @@ POST /restore  {"tar": "<base64>"}            (called by orchestrator pre-assign
 
 POST /snapshot {}                             (called by orchestrator on evict)
                → {"tar": "<base64>"}          + trailer X-Snapshot-Status: ok
+
+POST /sync-uploads/manifest                   (called by orchestrator before tools/call)
+               {"manifest": [{"filename":"x","sha256":"<hex>"}, ...]}
+               → {"missing": [{"filename":"x","sha256":"<hex>"}, ...]}
+
+POST /sync-uploads/blobs                      (called by orchestrator with the missing bytes)
+               {"files": [{"filename":"x","sha256":"<hex>","contents":"<base64>"}, ...]}
+               → {"written": N}
 
 GET  /health   → {"status": "ok"}
 ```
