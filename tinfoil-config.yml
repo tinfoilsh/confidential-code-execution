@@ -7,7 +7,7 @@ memory: 16384
 
 containers:
   - name: "orchestrator"
-    image: "ghcr.io/tinfoilsh/confidential-code-execution@sha256:c6789ace90eafbf5d6795e2972258b056955234836f6e3a52499115864779527" # v0.0.4
+    image: "ghcr.io/tinfoilsh/confidential-code-execution@sha256:82f2250e635bc82ab7d38529d7378dfadd214592b617a015d6e4402cf1f124b3" # v0.0.5
     env:
       - POOL_SIZE: "4"
       - IDLE_TIMEOUT: "180"
