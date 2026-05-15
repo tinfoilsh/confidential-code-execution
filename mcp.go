@@ -23,7 +23,7 @@ var base64Url32Re = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 //	    "encryptionKey":      "<43-char base64url>",
 //	    "containerAuthToken": "<64 hex>",
 //	    "uploads": [
-//	      {"file_id": "<64 hex>", "filename": "report.pdf", "sha256": "<64 hex>"},
+//	      {"fileAccessToken": "<64 hex>", "filename": "report.pdf", "sha256": "<64 hex>"},
 //	      ...
 //	    ]
 //	  }
@@ -31,9 +31,9 @@ var base64Url32Re = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 //
 // uploads is optional. Absent = leave /user-uploads alone; present (even
 // empty) = reconcile /user-uploads to exactly match the manifest.
-// file_id is used to lookup from bucket.
+// fileAccessToken is used to lookup from bucket.
 // filename is used for the filename
-// file_sha is used for fast path check against sandbox environment
+// sha256 is used for fast path check against sandbox environment
 const codeExecMetaKey = "tinfoil_code_exec"
 
 type jsonRPCRequest struct {
@@ -220,14 +220,14 @@ func extractUploads(params map[string]any) ([]uploadFile, *rpcError) {
 		if !ok {
 			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d] must be an object", codeExecMetaKey, i)}
 		}
-		fileID, _ := entry["file_id"].(string)
+		fileAccessToken, _ := entry["fileAccessToken"].(string)
 		filename, _ := entry["filename"].(string)
 		sha, _ := entry["sha256"].(string)
-		if fileID == "" {
-			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].file_id is required", codeExecMetaKey, i)}
+		if fileAccessToken == "" {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].fileAccessToken is required", codeExecMetaKey, i)}
 		}
-		if !hex64Re.MatchString(fileID) {
-			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].file_id has invalid format", codeExecMetaKey, i)}
+		if !hex64Re.MatchString(fileAccessToken) {
+			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].fileAccessToken has invalid format", codeExecMetaKey, i)}
 		}
 		if filename == "" {
 			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].filename is required", codeExecMetaKey, i)}
@@ -235,7 +235,7 @@ func extractUploads(params map[string]any) ([]uploadFile, *rpcError) {
 		if sha == "" || !hex64Re.MatchString(sha) {
 			return nil, &rpcError{Code: -32602, Message: fmt.Sprintf("params._meta.%s.uploads[%d].sha256 must be 64 hex chars", codeExecMetaKey, i)}
 		}
-		files = append(files, uploadFile{FileID: fileID, Filename: filename, Sha256: sha})
+		files = append(files, uploadFile{FileAccessToken: fileAccessToken, Filename: filename, Sha256: sha})
 	}
 	return files, nil
 }

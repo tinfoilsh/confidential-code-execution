@@ -12,13 +12,13 @@ import (
 )
 
 // uploadFile is one entry from _meta.tinfoil_code_exec.uploads.
-//   - FileID:   bucket access_token
-//   - Filename: file-name
-//   - Sha256:   expected hex sha256 of the file's plaintext bytes
+//   - FileAccessToken: bucket access_token
+//   - Filename:        file-name
+//   - Sha256:          expected hex sha256 of the file's plaintext bytes
 type uploadFile struct {
-	FileID   string `json:"file_id"`
-	Filename string `json:"filename"`
-	Sha256   string `json:"sha256"`
+	FileAccessToken string `json:"fileAccessToken"`
+	Filename        string `json:"filename"`
+	Sha256          string `json:"sha256"`
 }
 
 // fetchFile retrieves one uploaded file's plaintext bytes from buckets.
@@ -64,7 +64,7 @@ func (m *Manager) SyncUploads(ctx context.Context, accessToken string, files []u
 		return nil
 	}
 
-	// Map missing shas back to their bucket file_id.
+	// Map missing shas back to their bucket fileAccessToken.
 	bySha := make(map[string]uploadFile, len(files))
 	for _, f := range files {
 		bySha[f.Sha256] = f
@@ -93,7 +93,7 @@ func (m *Manager) SyncUploads(ctx context.Context, accessToken string, files []u
 		wg.Add(1)
 		go func(i int, f uploadFile) {
 			defer wg.Done()
-			data, err := m.buckets.fetchFile(ctx, bearer, f.FileID, encryptionKey)
+			data, err := m.buckets.fetchFile(ctx, bearer, f.FileAccessToken, encryptionKey)
 			results[i] = fetchResult{idx: i, data: data, err: err}
 		}(i, f)
 	}

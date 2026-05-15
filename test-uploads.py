@@ -108,7 +108,7 @@ def main() -> None:
                     "containerAuthToken": container_auth_token,
                     "encryptionKey": enc_key_url,
                     "uploads": [
-                        {"file_id": file_id, "filename": filename, "sha256": sha256},
+                        {"fileAccessToken": file_id, "filename": filename, "sha256": sha256},
                     ],
                 },
             },
