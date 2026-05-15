@@ -89,7 +89,7 @@ func main() {
 		ShutdownDeadline:       time.Duration(envInt("SHUTDOWN_DEADLINE", 25)) * time.Second,
 		// Execution Environment
 		EnvironmentRepo: envStr("ENVIRONMENT_REPO", "tinfoilsh/code-execution-environment"),
-		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.13"),
+		EnvironmentTag:  envStr("ENVIRONMENT_TAG", "v0.0.14"),
 	}
 
 	port := envInt("PORT", 7070)
