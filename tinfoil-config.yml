@@ -18,7 +18,6 @@ networks:
     egress: open
 
 shim:
-  listen-port: 443
   upstream-port: 7070
   paths:
     - /mcp
